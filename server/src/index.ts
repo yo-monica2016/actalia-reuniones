@@ -28,6 +28,24 @@ function nombreArchivoDescarga(titulo: string, id: number, ext: string): string 
       .slice(0, 50) || 'reunion'
   return `${base}_${id}.${ext}`
 }
+function clasificarTipoArchivo(mime: string, originalname: string): string {
+  const lower = originalname.toLowerCase()
+  if (mime.startsWith('image/')) return 'imagen'
+  if (mime.startsWith('video/')) return 'video'
+  if (mime.startsWith('audio/')) return 'audio'
+  if (
+    lower.endsWith('.pptx') ||
+    lower.endsWith('.ppt') ||
+    lower.endsWith('.pdf') ||
+    lower.endsWith('.odp') ||
+    mime.includes('presentation') ||
+    mime === 'application/pdf'
+  ) {
+    return 'documento'
+  }
+  return 'documento'
+}
+
 const uploadsDir = path.join(__dirname, '..', 'uploads')
 
 if (!fs.existsSync(uploadsDir)) {
@@ -310,9 +328,9 @@ app.get('/api/reuniones/:id/transcripcion.pdf', async (req: Request, res: Respon
     }
 
     const transcripcion = String(row.transcripcion ?? '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .trim()
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .trim()
     if (!transcripcion) {
       res.status(404).json({ error: 'no hay transcripción' })
       return
@@ -392,61 +410,72 @@ app.delete('/api/reuniones/:id', async (req: Request, res: Response) => {
 })
 
 
-app.post(
-  '/api/reuniones/:id/audio',
-  upload.single('file'),
-  async (req: Request, res: Response) => {
-    const id = parseId(req.params.id)
-    if (id === null) {
-      res.status(400).json({ error: 'id inválido' })
+async function handleSubirArchivoReunion(req: Request, res: Response) {
+  const id = parseId(req.params.id)
+  if (id === null) {
+    res.status(400).json({ error: 'id inválido' })
+    return
+  }
+  try {
+    const [existing] = await pool.query<RowDataPacket[]>(
+      'SELECT id, estado FROM reuniones WHERE id = ? LIMIT 1',
+      [id],
+    )
+    if (!existing[0]) {
+      res.status(404).json({ error: 'reunión no encontrada' })
       return
     }
-    try {
-      const [existing] = await pool.query<RowDataPacket[]>(
-        'SELECT id FROM reuniones WHERE id = ? LIMIT 1',
-        [id],
-      )
-      if (!existing[0]) {
-        res.status(404).json({ error: 'reunión no encontrada' })
-        return
-      }
-      if (!req.file) {
-        res.status(400).json({ error: 'falta archivo (campo multipart: file)' })
-        return
-      }
-      const storageKey = req.file.filename
-      const mime = req.file.mimetype
-      const tamanoBytes = req.file.size
-      const isVideo = mime.startsWith('video/')
-      const tipo = isVideo ? 'video' : 'audio'
+    if (!req.file) {
+      res.status(400).json({ error: 'falta archivo (campo multipart: file)' })
+      return
+    }
+    const storageKey = req.file.filename
+    const mime = req.file.mimetype
+    const tamanoBytes = req.file.size
+    const tipo = clasificarTipoArchivo(mime, req.file.originalname)
 
-      const [insertFile] = await pool.query<ResultSetHeader>(
-        `INSERT INTO archivos_reunion (reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos)
-         VALUES (?, ?, ?, ?, ?, NULL)`,
-        [id, tipo, storageKey, mime, tamanoBytes],
-      )
+    const [insertFile] = await pool.query<ResultSetHeader>(
+      `INSERT INTO archivos_reunion (reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos)
+       VALUES (?, ?, ?, ?, ?, NULL)`,
+      [id, tipo, storageKey, mime, tamanoBytes],
+    )
 
+    if (tipo === 'audio' || tipo === 'video') {
       await pool.query(
         `UPDATE reuniones SET estado = ?, actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
         ['audio_listo', id],
       )
-
-      res.status(201).json({
-        reunion_id: id,
-        archivo_id: insertFile.insertId,
-        storage_key: storageKey,
-        mime,
-        tamano_bytes: tamanoBytes,
-        tipo,
-        estado: 'audio_listo',
-        estado_etiqueta: etiquetaEstado('audio_listo'),
-      })
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err)
-      res.status(500).json({ error: message })
+    } else {
+      await pool.query(
+        `UPDATE reuniones SET actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
+        [id],
+      )
     }
-  },
-)
+
+    const [reunionRows] = await pool.query<RowDataPacket[]>(
+      'SELECT estado FROM reuniones WHERE id = ? LIMIT 1',
+      [id],
+    )
+    const estado = String(reunionRows[0]?.estado ?? existing[0].estado ?? 'borrador')
+
+    res.status(201).json({
+      reunion_id: id,
+      archivo_id: insertFile.insertId,
+      storage_key: storageKey,
+      mime,
+      tamano_bytes: tamanoBytes,
+      tipo,
+      estado,
+      estado_etiqueta: etiquetaEstado(estado),
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    res.status(500).json({ error: message })
+  }
+}
+
+app.post('/api/reuniones/:id/audio', upload.single('file'), handleSubirArchivoReunion)
+app.post('/api/reuniones/:id/archivo', upload.single('file'), handleSubirArchivoReunion)
 app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) => {
   const id = parseId(req.params.id)
   if (id === null) {
@@ -464,7 +493,7 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
       return
     }
 
-    
+
     const archivoIdRaw = req.body?.archivoId
     let storageKey = ''
 
@@ -664,6 +693,12 @@ app.get('/api/reuniones/:reunionId/archivos/:archivoId', async (req: Request, re
       return
     }
     const mime = row.mime ? String(row.mime) : 'application/octet-stream'
+    const safeName = storageKey.replace(/[^\w.\-]+/g, '_')
+    const forceDownload = req.query.download === '1'
+    res.setHeader(
+      'Content-Disposition',
+      `${forceDownload ? 'attachment' : 'inline'}; filename="${safeName}"`,
+    )
     res.type(mime)
     res.sendFile(path.resolve(filePath))
   } catch (err) {

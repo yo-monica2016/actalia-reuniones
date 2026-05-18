@@ -5,11 +5,13 @@ import {
   getReunion,
   listReuniones,
   uploadAudio,
+  uploadArchivo,
   transcribirReunion,
   resumirReunion,
   eliminarArchivo,
   eliminarReunion,
   archivoUrl,
+  downloadArchivo,
   transcripcionTxtUrl,
   transcripcionPdfUrl,
   API_BASE,
@@ -123,6 +125,28 @@ function App() {
       setLoading(false)
     }
   }
+
+  async function handleSubirMaterial(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file || selectedId == null) return
+    setLoading(true)
+    setMensaje(null)
+    try {
+      const actualizada = await uploadArchivo(selectedId, file)
+      setDetalle(actualizada)
+      await cargarLista()
+      setMensaje({ tipo: 'ok', text: 'Archivo subido correctamente' })
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al subir',
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
+
   async function handleTranscribir(archivoId?: number) {
     if (selectedId == null) return
     setLoading(true)
@@ -205,6 +229,20 @@ function App() {
       mediaRefs.current.set(archivoId, el)
     } else {
       mediaRefs.current.delete(archivoId)
+    }
+  }
+
+  async function handleDescargarArchivo(archivoId: number, storageKey: string) {
+    if (selectedId == null) return
+    setMensaje(null)
+    try {
+      await downloadArchivo(selectedId, archivoId, storageKey)
+      setMensaje({ tipo: 'ok', text: 'Descarga iniciada' })
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al descargar',
+      })
     }
   }
 
@@ -462,6 +500,22 @@ function App() {
                 </div>
               </section>
 
+              <section className="upload-section">
+                <h3>Fotos y presentaciones</h3>
+                <p className="muted">
+                  Imágenes (pizarra, fotos) y documentos: PDF, PowerPoint (.pptx, .ppt).
+                </p>
+                <label className="file-label">
+                  <input
+                    type="file"
+                    accept="image/*,.pdf,.ppt,.pptx,.odp,application/pdf,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                    onChange={handleSubirMaterial}
+                    disabled={loading || apiOk !== true}
+                  />
+                  {loading ? 'Subiendo…' : 'Elegir foto o PowerPoint'}
+                </label>
+              </section>
+
               <section>
                 <h3>Archivos</h3>
                 {!detalle.archivos?.length ? (
@@ -497,25 +551,41 @@ function App() {
                               onPlay={() => handleMediaPlay(a.id)}
                             />
                           )}
-                          <a
-                            className="archivo-download"
-                            href={url}
-                            download={a.storage_key}
-                          >
-                            Descargar
-                          </a>
+                          {a.tipo === 'imagen' && (
+                            <img
+                              className="archivo-imagen"
+                              src={url}
+                              alt={a.storage_key}
+                            />
+                          )}
+                          {a.tipo === 'documento' && (
+                            <p className="muted archivo-doc-hint">
+                              Documento adjunto — usa Descargar para abrirlo en PowerPoint o el
+                              visor de PDF.
+                            </p>
+                          )}
                           <button
                             type="button"
-                            className="btn-secondary btn-archivo-accion"
-                            onClick={() => void handleTranscribir(a.id)}
-                            disabled={
-                              loading ||
-                              apiOk !== true ||
-                              detalle.estado === 'transcribiendo'
-                            }
+                            className="archivo-download"
+                            onClick={() => void handleDescargarArchivo(a.id, a.storage_key)}
+                            disabled={loading || apiOk !== true}
                           >
-                            Transcribir este
+                            Descargar
                           </button>
+                          {(a.tipo === 'audio' || a.tipo === 'video') && (
+                            <button
+                              type="button"
+                              className="btn-secondary btn-archivo-accion"
+                              onClick={() => void handleTranscribir(a.id)}
+                              disabled={
+                                loading ||
+                                apiOk !== true ||
+                                detalle.estado === 'transcribiendo'
+                              }
+                            >
+                              Transcribir este
+                            </button>
+                          )}
                           <button
                             type="button"
                             className="btn-secondary btn-archivo-accion btn-archivo-eliminar"

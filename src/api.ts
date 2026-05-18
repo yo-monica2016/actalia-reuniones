@@ -50,6 +50,16 @@ export async function uploadAudio(reunionId: number, file: File): Promise<Reunio
   await parseJson<unknown>(res)
   return getReunion(reunionId)
 }
+export async function uploadArchivo(reunionId: number, file: File): Promise<Reunion> {
+  const form = new FormData()
+  form.append('file', file)
+  const res = await fetch(`${API_BASE}/api/reuniones/${reunionId}/archivo`, {
+    method: 'POST',
+    body: form,
+  })
+  await parseJson<unknown>(res)
+  return getReunion(reunionId)
+}
 export async function transcribirReunion(
   reunionId: number,
   archivoId?: number,
@@ -93,6 +103,34 @@ export async function resumirReunion(reunionId: number): Promise<Reunion> {
 }
 export function archivoUrl(reunionId: number, archivoId: number): string {
   return `${API_BASE}/api/reuniones/${reunionId}/archivos/${archivoId}`
+}
+
+export function nombreArchivoDescarga(storageKey: string): string {
+  const sinPrefijo = storageKey.replace(/^\d+-/, '')
+  return sinPrefijo || storageKey
+}
+
+export async function downloadArchivo(
+  reunionId: number,
+  archivoId: number,
+  storageKey: string,
+): Promise<void> {
+  const res = await fetch(
+    `${archivoUrl(reunionId, archivoId)}?download=1`,
+  )
+  if (!res.ok) {
+    const data = (await res.json().catch(() => ({}))) as ApiError
+    throw new Error(data.error ?? `Error ${res.status}`)
+  }
+  const blob = await res.blob()
+  const enlace = document.createElement('a')
+  const url = URL.createObjectURL(blob)
+  enlace.href = url
+  enlace.download = nombreArchivoDescarga(storageKey)
+  document.body.appendChild(enlace)
+  enlace.click()
+  enlace.remove()
+  URL.revokeObjectURL(url)
 }
 export function transcripcionTxtUrl(reunionId: number): string {
   return `${API_BASE}/api/reuniones/${reunionId}/transcripcion.txt`

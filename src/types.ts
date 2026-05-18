@@ -10,7 +10,7 @@ export type EstadoReunion =
 export interface ArchivoReunion {
   id: number
   reunion_id: number
-  tipo: 'audio' | 'video'
+  tipo: 'audio' | 'video' | 'imagen' | 'documento'
   storage_key: string
   mime: string | null
   tamano_bytes: number | null
