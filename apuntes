@@ -1,0 +1,137 @@
+Tu carpeta ya no está vacía: tienes un proyecto Vite + React + TypeScript (npm run dev funciona con ese stack). Así que el “paso 1” puede ser comprobar que ese cimiento está bien y seguir con el 2. Abajo va el camino completo y el primer paso concreto.
+
+Visión general (lo que vas a construir)
+Grabación: audio (y opcionalmente vídeo) de la reunión.
+Transcripción (entiendo que decías transcripción, no “transacción”): texto a partir del audio.
+Resumen: texto corto generado a partir de la transcripción.
+Más adelante: otro programa consumirá tu sistema por URL (API REST) → conviene diseñar backend + base de datos desde el principio, no solo el navegador.
+Pasos en orden (desde cero lógico)
+#	Paso
+1
+Base del repo y app frontend (Node, Git, proyecto Vite React TS, que arranque en local).
+2
+Definir qué guardas en BD: reunión, archivo, estado (pendiente/transcrito/resumido), transcripción, resumen, fechas, errores, etc.
+3
+Elegir motor de BD (MySQL/MariaDB con Laragon es natural; SQLite sirve para empezar muy rápido en local).
+4
+Backend con API (subida de audio, CRUD de reuniones, endpoints que luego usará el otro programa).
+5
+Pipeline en segundo plano: cola o jobs (transcripción y resumen tardan; no suele hacerse todo en una sola petición HTTP).
+6
+Proveedores: servicio de speech-to-text + servicio de LLM para el resumen (o modelo local si quieres autosuficiencia).
+7
+Frontend: grabar con MediaRecorder o subir archivo; pantalla de estado; ver transcripción y resumen.
+8
+Integración por URL: URL base, autenticación (API key/JWT), CORS, documentación tipo OpenAPI.
+Paso 1 (el primero): cimiento del proyecto
+Objetivo: tener un proyecto versionado que arranque en tu PC sin dudas.
+
+Node.js en versión LTS (20 o 22, por ejemplo). Comprueba: node -v y npm -v.
+Git en la carpeta: git init, y un .gitignore que ignore node_modules/, builds, .env, etc.
+Proyecto frontend (en tu caso ya encaja con Vite + React + TS): en la raíz de actalia-reuniones, que existan package.json, vite.config, y que npm install y npm run dev abran la app en el navegador.
+Opcional pero recomendable: un archivo .env.example (sin secretos) donde más adelante documentarás URLs de API y claves; el .env real no se sube a Git.
+Si al abrir la carpeta ya ves la plantilla de Vite y el dev server corre, el paso 1 lo puedes dar por hecho y pasar al paso 2: diseñar tablas y estados (reunión → archivo → transcripción → resumen → “listo” / error).
+
+Nota sobre “solo carpeta”
+Dices que solo creaste la carpeta; en el workspace ya hay actalia-reuniones con dependencias instaladas. Si eso es correcto en tu máquina, no hace falta repetir create vite; solo verifica el paso 1. Si en otra copia del proyecto solo tienes la carpeta vacía, ahí sí el paso 1 sería crear el proyecto con la plantilla oficial de Vite + React + TypeScript en esa carpeta.
+
+Cuando termines el paso 1, el siguiente es bajar a papel (o a un esquema) las entidades y estados de la BD; si quieres, en el siguiente mensaje te propongo un modelo mínimo de tablas alineado con “grabar → transcribir → resumir → API para otro programa”, sin tocar aún la URL externa.
+
+
+
+
+
+
+
+Punto 2: qué guardar en la base de datos (modelo mínimo)
+Objetivo: decidir qué entidades tienes, qué campos llevan y en qué orden pasa cada reunión por grabación → transcripción → resumen, para que luego el backend y la API encajen sin rehacer el modelo.
+
+2.1 — Lista mental (una frase por cosa)
+Cada reunión es un registro con título, fechas y estado del proceso.
+El audio (o vídeo) es un archivo ligado a esa reunión (ruta o clave en almacenamiento).
+La transcripción es texto largo (y opcionalmente JSON con marcas de tiempo).
+El resumen es texto corto (y opcionalmente bullets o JSON estructurado).
+Los errores y metadatos del proveedor (Whisper, API de resumen, etc.) conviene guardarlos para depurar.
+2.2 — Tabla única “reuniones” (válido para empezar)
+Si quieres lo más simple al principio, una sola tabla puede bastar:
+
+Campo	Tipo habitual	Para qué
+id
+UUID o entero autoincremental
+Identificador para la API (/reuniones/:id).
+titulo
+texto
+Nombre visible de la reunión.
+creado_en
+fecha/hora
+Auditoría.
+actualizado_en
+fecha/hora
+Último cambio.
+estado
+texto o enum
+Ver 2.4 (pipeline).
+ruta_archivo o storage_key
+texto
+Dónde está el audio en disco/S3.
+mime_tipo
+texto
+p. ej. audio/webm, audio/wav.npm run dev
+
+duracion_segundos
+entero nullable
+Si lo calculas al subir o al procesar.
+transcripcion
+texto largo (LONGTEXT) nullable
+Resultado de la transcripción.
+resumen
+texto largo nullable
+Resultado del resumen.
+error_mensaje
+texto nullable
+Si falla transcripción o resumen.
+meta
+JSON nullable
+Modelo usado, idioma, versión del job, etc.
+Con eso ya puedes exponer más adelante algo como: “dame reunión por id y devuélveme estado + transcripción + resumen”.
+
+2.3 — Dos tablas (un poco más ordenado)
+Cuando crezcas, separar archivo del resto ayuda:
+
+reuniones: id, titulo, estado, creado_en, actualizado_en, error_mensaje, meta.
+archivos_reunion: id, reunion_id, tipo (audio/video), storage_key, mime, tamano_bytes, duracion_segundos, creado_en.
+Transcripción y resumen pueden seguir en reuniones o en tablas transcripciones / resumenes con historial (varias versiones). Para el MVP, columnas en reuniones suele bastar.
+
+2.4 — Estados del pipeline (muy importante)
+Define exactamente estos valores y no mezcles conceptos:
+
+Estado	Significado
+borrador
+Reunión creada, aún sin audio o incompleta.
+audio_listo
+Audio subido o grabación finalizada y guardada.
+transcribiendo
+Job en curso.
+transcrito
+transcripcion rellena, listo para resumir.
+resumiendo
+Job de resumen en curso.
+completado
+resumen relleno.
+error
+Algo falló; mira error_mensaje.
+Así el otro programa puede consultar por id y saber si ya puede leer transcripción o resumen.
+
+2.5 — Qué decides tú en el punto 2 (checklist)
+¿Una tabla o dos al inicio? (recomendación: una tabla para ir rápido; refactor cuando necesites varios archivos o historial).
+¿UUID o entero para id? (para APIs públicas, UUID evita enumeración simple).
+Lista cerrada de estado (los de arriba o los que recortes).
+Qué va en meta (JSON) sin mezclarlo con columnas fijas (proveedor, job_id, idioma detectado, etc.).
+2.6 — Criterio de “punto 2 terminado”
+Has terminado el punto 2 cuando tienes por escrito (en tus apuntes basta):
+
+Nombre de tabla(s) y columnas.
+Valores permitidos de estado y qué transiciones son legales.
+Qué devolverá tu API más
+
+
