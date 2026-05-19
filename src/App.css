@@ -469,3 +469,16 @@
   margin: 0.5rem 0 0;
   font-size: 0.9rem;
 }
+
+.archivo-ocr-texto {
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--code-bg, #f8fafc);
+}
+
+.archivo-ocr-texto h4 {
+  margin: 0 0 0.5rem;
+  font-size: 0.95rem;
+}

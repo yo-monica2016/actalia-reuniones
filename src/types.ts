@@ -16,6 +16,7 @@ export interface ArchivoReunion {
   tamano_bytes: number | null
   duracion_segundos: number | null
   creado_en: string
+  texto_ocr?: string | null
 }
 
 export interface Reunion {

@@ -16,8 +16,10 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "jszip": "^3.10.1",
     "multer": "^2.1.1",
     "mysql2": "^3.22.3",
+    "pdf-parse": "^2.4.5",
     "pdfkit": "^0.18.0"
   },
   "devDependencies": {
@@ -25,6 +27,7 @@
     "@types/express": "^5.0.6",
     "@types/multer": "^2.1.0",
     "@types/node": "^25.7.0",
+    "@types/pdf-parse": "^1.1.5",
     "@types/pdfkit": "^0.17.6",
     "tsx": "^4.21.1",
     "typescript": "^6.0.3"

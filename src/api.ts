@@ -132,6 +132,27 @@ export async function downloadArchivo(
   enlace.remove()
   URL.revokeObjectURL(url)
 }
+
+export async function extraerTextoImagen(
+  reunionId: number,
+  archivoId: number,
+): Promise<Reunion> {
+  const res = await fetch(
+    `${API_BASE}/api/reuniones/${reunionId}/archivos/${archivoId}/ocr`,
+    { method: 'POST' },
+  )
+  return parseJson<Reunion>(res)
+}
+export async function extraerTextoDocumento(
+  reunionId: number,
+  archivoId: number,
+): Promise<Reunion> {
+  const res = await fetch(
+    `${API_BASE}/api/reuniones/${reunionId}/archivos/${archivoId}/texto`,
+    { method: 'POST' },
+  )
+  return parseJson<Reunion>(res)
+}
 export function transcripcionTxtUrl(reunionId: number): string {
   return `${API_BASE}/api/reuniones/${reunionId}/transcripcion.txt`
 }
@@ -139,5 +160,9 @@ export function transcripcionTxtUrl(reunionId: number): string {
 export function transcripcionPdfUrl(reunionId: number): string {
   return `${API_BASE}/api/reuniones/${reunionId}/transcripcion.pdf`
 }
+export function actaPdfUrl(reunionId: number): string {
+  return `${API_BASE}/api/reuniones/${reunionId}/acta.pdf`
+}
+
 
 export { API_BASE }
