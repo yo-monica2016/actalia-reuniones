@@ -5,13 +5,18 @@ import {
   getReunion,
   listReuniones,
   uploadAudio,
+  uploadArchivo,
   transcribirReunion,
   resumirReunion,
   eliminarArchivo,
   eliminarReunion,
   archivoUrl,
+  downloadArchivo,
+  extraerTextoImagen,
+  extraerTextoDocumento,
   transcripcionTxtUrl,
   transcripcionPdfUrl,
+  actaPdfUrl,
   API_BASE,
 } from './api'
 import { etiquetaEstado } from './estados'
@@ -123,6 +128,28 @@ function App() {
       setLoading(false)
     }
   }
+
+  async function handleSubirMaterial(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    if (!file || selectedId == null) return
+    setLoading(true)
+    setMensaje(null)
+    try {
+      const actualizada = await uploadArchivo(selectedId, file)
+      setDetalle(actualizada)
+      await cargarLista()
+      setMensaje({ tipo: 'ok', text: 'Archivo subido correctamente' })
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al subir',
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
+
   async function handleTranscribir(archivoId?: number) {
     if (selectedId == null) return
     setLoading(true)
@@ -205,6 +232,58 @@ function App() {
       mediaRefs.current.set(archivoId, el)
     } else {
       mediaRefs.current.delete(archivoId)
+    }
+  }
+
+  async function handleDescargarArchivo(archivoId: number, storageKey: string) {
+    if (selectedId == null) return
+    setMensaje(null)
+    try {
+      await downloadArchivo(selectedId, archivoId, storageKey)
+      setMensaje({ tipo: 'ok', text: 'Descarga iniciada' })
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al descargar',
+      })
+    }
+  }
+
+  async function handleExtraerTextoImagen(archivoId: number) {
+    if (selectedId == null) return
+    setLoading(true)
+    setMensaje(null)
+    try {
+      const actualizada = await extraerTextoImagen(selectedId, archivoId)
+      setDetalle(actualizada)
+      setMensaje({ tipo: 'ok', text: 'Texto extraído de la imagen' })
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al extraer texto',
+      })
+      await cargarDetalle(selectedId)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleExtraerTextoDocumento(archivoId: number) {
+    if (selectedId == null) return
+    setLoading(true)
+    setMensaje(null)
+    try {
+      const actualizada = await extraerTextoDocumento(selectedId, archivoId)
+      setDetalle(actualizada)
+      setMensaje({ tipo: 'ok', text: 'Texto extraído del documento' })
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al extraer texto',
+      })
+      await cargarDetalle(selectedId)
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -462,6 +541,22 @@ function App() {
                 </div>
               </section>
 
+              <section className="upload-section">
+                <h3>Fotos y presentaciones</h3>
+                <p className="muted">
+                  Imágenes (pizarra, fotos) y documentos: PDF, PowerPoint (.pptx, .ppt).
+                </p>
+                <label className="file-label">
+                  <input
+                    type="file"
+                    accept="image/*,.pdf,.ppt,.pptx,.odp,application/pdf,application/vnd.ms-powerpoint,application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                    onChange={handleSubirMaterial}
+                    disabled={loading || apiOk !== true}
+                  />
+                  {loading ? 'Subiendo…' : 'Elegir foto o PowerPoint'}
+                </label>
+              </section>
+
               <section>
                 <h3>Archivos</h3>
                 {!detalle.archivos?.length ? (
@@ -497,25 +592,75 @@ function App() {
                               onPlay={() => handleMediaPlay(a.id)}
                             />
                           )}
-                          <a
-                            className="archivo-download"
-                            href={url}
-                            download={a.storage_key}
-                          >
-                            Descargar
-                          </a>
+                          {a.tipo === 'imagen' && (
+                            <>
+                              <img
+                                className="archivo-imagen"
+                                src={url}
+                                alt={a.storage_key}
+                              />
+                              <button
+                                type="button"
+                                className="btn-secondary btn-archivo-accion"
+                                onClick={() => void handleExtraerTextoImagen(a.id)}
+                                disabled={loading || apiOk !== true}
+                              >
+                                {loading ? 'Extrayendo texto…' : 'Extraer texto (OCR)'}
+                              </button>
+                              {a.texto_ocr?.trim() && (
+                                <div className="archivo-ocr-texto">
+                                  <h4>Texto de la imagen</h4>
+                                  <p className="text-block">{a.texto_ocr}</p>
+                                </div>
+                              )}
+                            </>
+                          )}
+                          {a.tipo === 'documento' && (
+                            <>
+                              <p className="muted archivo-doc-hint">
+                                PDF o PowerPoint (.pptx). El formato .ppt antiguo no está
+                                soportado.
+                              </p>
+                              <button
+                                type="button"
+                                className="btn-secondary btn-archivo-accion"
+                                onClick={() => void handleExtraerTextoDocumento(a.id)}
+                                disabled={loading || apiOk !== true}
+                              >
+                                {loading
+                                  ? 'Extrayendo texto…'
+                                  : 'Extraer texto del documento'}
+                              </button>
+                              {a.texto_ocr?.trim() && (
+                                <div className="archivo-ocr-texto">
+                                  <h4>Texto del documento</h4>
+                                  <p className="text-block">{a.texto_ocr}</p>
+                                </div>
+                              )}
+                            </>
+                          )}
                           <button
                             type="button"
-                            className="btn-secondary btn-archivo-accion"
-                            onClick={() => void handleTranscribir(a.id)}
-                            disabled={
-                              loading ||
-                              apiOk !== true ||
-                              detalle.estado === 'transcribiendo'
-                            }
+                            className="archivo-download"
+                            onClick={() => void handleDescargarArchivo(a.id, a.storage_key)}
+                            disabled={loading || apiOk !== true}
                           >
-                            Transcribir este
+                            Descargar
                           </button>
+                          {(a.tipo === 'audio' || a.tipo === 'video') && (
+                            <button
+                              type="button"
+                              className="btn-secondary btn-archivo-accion"
+                              onClick={() => void handleTranscribir(a.id)}
+                              disabled={
+                                loading ||
+                                apiOk !== true ||
+                                detalle.estado === 'transcribiendo'
+                              }
+                            >
+                              Transcribir este
+                            </button>
+                          )}
                           <button
                             type="button"
                             className="btn-secondary btn-archivo-accion btn-archivo-eliminar"
@@ -605,7 +750,27 @@ function App() {
                   </div>
                 </section>
               )}
-
+              {(detalle.resumen?.trim() ||
+                detalle.transcripcion?.trim() ||
+                detalle.archivos?.some((a) => a.texto_ocr?.trim()) ||
+                (detalle.archivos?.length ?? 0) > 0) && (
+                <section className="upload-section descarga-transcripcion">
+                  <h3>Acta de la reunión</h3>
+                  <p className="muted">
+                    PDF con resumen, transcripción (si existe) y textos extraídos de fotos y
+                    documentos.
+                  </p>
+                  <div className="descarga-transcripcion-botones">
+                    <a
+                      className="btn-secondary descarga-link"
+                      href={actaPdfUrl(detalle.id)}
+                      download
+                    >
+                      Descargar acta (PDF)
+                    </a>
+                  </div>
+                </section>
+              )}
               {detalle.estado === 'borrador' && !detalle.archivos?.length && (
                 <p className="hint">Sube un audio para pasar al estado «Audio listo».</p>
               )}
