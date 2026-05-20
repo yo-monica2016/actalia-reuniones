@@ -20,7 +20,8 @@
     "multer": "^2.1.1",
     "mysql2": "^3.22.3",
     "pdf-parse": "^2.4.5",
-    "pdfkit": "^0.18.0"
+    "pdfkit": "^0.18.0",
+    "sharp": "^0.34.5"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",

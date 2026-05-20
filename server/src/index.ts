@@ -10,7 +10,12 @@ import multer from 'multer'
 import mysql from 'mysql2/promise'
 import type { ResultSetHeader, RowDataPacket } from 'mysql2'
 import PDFDocument from 'pdfkit'
+import sharp from 'sharp'
 import { etiquetaEstado } from './estados'
+import {
+  transcribirStorageKey as transcribirArchivoLocal,
+  whisperTxtPath,
+} from './transcripcion'
 
 const PORT = Number(process.env.PORT) || 3001
 
@@ -95,57 +100,13 @@ function resolveOcrTessdata(language: string): { langFile: string; tessdataPrefi
     `Falta el idioma OCR "${language}" en ${expected}. Descarga ${language}.traineddata en server/tessdata.`,
   )
 }
-function whisperTxtPath(storageKey: string): string {
-  const base = path.parse(storageKey).name
-  return path.join(uploadsDir, `${base}.txt`)
-}
-function resolveWhisperTxtPath(storageKey: string): string {
-  const expected = whisperTxtPath(storageKey)
-  if (fs.existsSync(expected)) return expected
-
-  const base = path.parse(storageKey).name.toLowerCase()
-  for (const file of fs.readdirSync(uploadsDir)) {
-    if (!file.toLowerCase().endsWith('.txt')) continue
-    if (path.parse(file).name.toLowerCase() === base) {
-      return path.join(uploadsDir, file)
-    }
-  }
-  return expected
+function encabezadoTranscripcionArchivo(storageKey: string): string {
+  const nombre = storageKey.replace(/^\d+-/, '') || storageKey
+  return `========== Audio: ${nombre} ==========`
 }
 
-
-function runWhisper(audioPath: string): Promise<void> {
-  const python = process.env.PYTHON_CMD ?? 'py'
-  const model = process.env.WHISPER_MODEL ?? 'base'
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-m',
-      'whisper',
-      audioPath,
-      '--language',
-      'Spanish',
-      '--model',
-      model,
-      '--output_dir',
-      uploadsDir,
-      '--output_format',
-      'txt',
-    ]
-    const child = spawn(python, args, {
-      cwd: uploadsDir,
-      shell: process.platform === 'win32',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    let stderr = ''
-    child.stderr?.on('data', (chunk) => {
-      stderr += String(chunk)
-    })
-    child.on('error', reject)
-    child.on('close', (code) => {
-      if (code === 0) resolve()
-      else reject(new Error(stderr.trim() || `Whisper terminó con código ${code}`))
-    })
-  })
+async function transcribirStorageKey(storageKey: string): Promise<string> {
+  return transcribirArchivoLocal(uploadsDir, storageKey)
 }
 
 function runOcr(imagePath: string): Promise<string> {
@@ -268,6 +229,103 @@ function generarResumenDesdeTranscripcion(transcripcion: string): string {
   if (limpio.length <= maxChars) return limpio
   return `${limpio.slice(0, maxChars).trim()}…`
 }
+
+interface ResumenAlmacenado {
+  global: string
+  porAudio: Record<string, string>
+}
+
+function extraerBloquesTranscripcion(transcripcion: string): { nombre: string; cuerpo: string }[] {
+  const t = transcripcion.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()
+  if (!t) return []
+
+  const bloques: { nombre: string; cuerpo: string }[] = []
+  const re = /========== Audio:\s*(.+?)\s*==========\n*/g
+  let m: RegExpExecArray | null
+  let lastIndex = 0
+  while ((m = re.exec(t)) !== null) {
+    if (m.index > lastIndex) {
+      const prev = t.slice(lastIndex, m.index).trim()
+      if (prev) bloques.push({ nombre: 'Intro', cuerpo: prev })
+    }
+    const start = m.index + m[0].length
+    const rest = t.slice(start)
+    const nextMatch = rest.search(/\n========== Audio:/)
+    const cuerpo = (nextMatch === -1 ? rest : rest.slice(0, nextMatch)).trim()
+    bloques.push({ nombre: m[1].trim(), cuerpo })
+    lastIndex = nextMatch === -1 ? t.length : start + nextMatch
+  }
+
+  if (bloques.length === 0) {
+    return [{ nombre: 'Transcripción', cuerpo: t }]
+  }
+  return bloques
+}
+
+function generarResumenCompleto(transcripcion: string): ResumenAlmacenado {
+  const bloques = extraerBloquesTranscripcion(transcripcion)
+  const porAudio: Record<string, string> = {}
+
+  for (const b of bloques) {
+    const cuerpo = b.cuerpo.trim()
+    if (!cuerpo) continue
+    const nombre = nombreVisibleArchivo(b.nombre)
+    const mini = generarResumenDesdeTranscripcion(cuerpo)
+    if (mini) porAudio[nombre] = mini
+  }
+
+  const keys = Object.keys(porAudio)
+  let global = ''
+  if (keys.length === 0) {
+    global = generarResumenDesdeTranscripcion(transcripcion)
+  } else if (keys.length === 1) {
+    global = porAudio[keys[0]] ?? ''
+  } else {
+    const textoParaGlobal = keys.map((k) => `${k}: ${porAudio[k]}`).join('\n\n')
+    global =
+      generarResumenDesdeTranscripcion(textoParaGlobal) || textoParaGlobal.slice(0, 500)
+  }
+
+  return { global, porAudio }
+}
+
+function leerResumenAlmacenado(raw: string | null | undefined): ResumenAlmacenado {
+  const t = String(raw ?? '').trim()
+  if (!t) return { global: '', porAudio: {} }
+  if (t.startsWith('{')) {
+    try {
+      const p = JSON.parse(t) as ResumenAlmacenado
+      return {
+        global: String(p.global ?? '').trim(),
+        porAudio:
+          p.porAudio && typeof p.porAudio === 'object' ? p.porAudio : {},
+      }
+    } catch {
+      return { global: t, porAudio: {} }
+    }
+  }
+  return {
+    global: t.replace(/========== Audio:\s*.+?\s*==========\s*/g, '').trim(),
+    porAudio: {},
+  }
+}
+
+function formatearResumenParaDescarga(data: ResumenAlmacenado): string {
+  const partes: string[] = []
+  for (const nombre of Object.keys(data.porAudio)) {
+    const texto = data.porAudio[nombre]?.trim()
+    if (texto) {
+      partes.push(`========== ${nombre} ==========\n\n${texto}`)
+    }
+  }
+  if (data.global.trim() && Object.keys(data.porAudio).length > 1) {
+    partes.push(`========== Resumen de la reunión ==========\n\n${data.global.trim()}`)
+  } else if (data.global.trim() && partes.length === 0) {
+    partes.push(data.global.trim())
+  }
+  return partes.join('\n\n')
+}
+
 function nombreVisibleArchivo(storageKey: string): string {
   const sinPrefijo = storageKey.replace(/^\d+-/, '')
   return sinPrefijo || storageKey
@@ -281,17 +339,96 @@ function etiquetaTipoArchivoActa(tipo: string): string {
   return tipo
 }
 
-function escribirPdfActa(
+const ARCHIVOS_LIST_SELECT = `SELECT id, reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos, creado_en, texto_ocr, incluir_imagen_acta
+       FROM archivos_reunion`
+
+function incluirImagenActaActivo(archivo: RowDataPacket): boolean {
+  const v = archivo.incluir_imagen_acta
+  if (v === null || v === undefined) return true
+  return v !== 0 && v !== false && v !== '0'
+}
+
+/** Imagen en PDF solo si el usuario la marcó (incluir_imagen_acta). */
+function debeIncrustarImagenEnActa(archivo: RowDataPacket): boolean {
+  if (String(archivo.tipo ?? '') !== 'imagen') return false
+  const storageKey = String(archivo.storage_key ?? '')
+  if (!storageKey || storageKey.includes('..') || /[/\\]/.test(storageKey)) return false
+  return incluirImagenActaActivo(archivo)
+}
+
+const ACTA_IMAGEN_FIT: [number, number] = [450, 280]
+const ACTA_IMAGEN_ALTO_APROX = ACTA_IMAGEN_FIT[1] + 24
+
+const PDFKIT_IMAGEN_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif'])
+
+async function prepararImagenParaPdf(filePath: string): Promise<string | Buffer | null> {
+  const ext = path.extname(filePath).toLowerCase()
+  if (PDFKIT_IMAGEN_EXT.has(ext)) return filePath
+  try {
+    return await sharp(filePath).png().toBuffer()
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error(`[acta.pdf] conversión sharp ${filePath}:`, msg)
+    return null
+  }
+}
+
+function asegurarEspacioImagenEnPagina(doc: InstanceType<typeof PDFDocument>): void {
+  const margenInf = doc.page.margins.bottom ?? 50
+  const limiteY = doc.page.height - margenInf
+  if (doc.y + ACTA_IMAGEN_ALTO_APROX > limiteY) {
+    doc.addPage()
+  }
+}
+
+async function incrustarImagenEnActaPdf(
+  doc: InstanceType<typeof PDFDocument>,
+  archivo: RowDataPacket,
+  uploadsDirPath: string,
+): Promise<void> {
+  if (!debeIncrustarImagenEnActa(archivo)) return
+  const storageKey = String(archivo.storage_key ?? '')
+  const filePath = path.join(uploadsDirPath, storageKey)
+  if (!fs.existsSync(filePath)) return
+
+  const imageSource = await prepararImagenParaPdf(filePath)
+  if (!imageSource) {
+    doc
+      .fontSize(9)
+      .fillColor('#666666')
+      .text(
+        `(No se pudo preparar la imagen ${path.extname(filePath)} para el PDF.)`,
+      )
+    doc.moveDown(0.5)
+    doc.fillColor('#000000')
+    return
+  }
+
+  asegurarEspacioImagenEnPagina(doc)
+
+  try {
+    doc.image(imageSource, { fit: ACTA_IMAGEN_FIT })
+    doc.moveDown(0.5)
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error(`[acta.pdf] no se pudo incrustar ${storageKey}:`, msg)
+    doc.fontSize(9).fillColor('#666666').text('(No se pudo incrustar esta imagen en el PDF.)')
+    doc.moveDown(0.5)
+    doc.fillColor('#000000')
+  }
+}
+
+async function escribirPdfActa(
   doc: InstanceType<typeof PDFDocument>,
   reunion: RowDataPacket,
   archivos: RowDataPacket[],
   uploadsDirPath: string,
-): void {
+): Promise<void> {
   const titulo = String(reunion.titulo ?? 'Reunión')
   const fecha = reunion.creado_en
     ? new Date(String(reunion.creado_en)).toLocaleString('es-ES')
     : ''
-  const resumen = String(reunion.resumen ?? '').trim()
+
   const transcripcion = String(reunion.transcripcion ?? '')
     .replace(/\r\n/g, '\n')
     .replace(/\r/g, '\n')
@@ -306,17 +443,7 @@ function escribirPdfActa(
   }
   doc.moveDown()
 
-  doc.fontSize(12).fillColor('#000000').text('Resumen', { underline: true })
-  doc.moveDown(0.5)
-  doc.fontSize(11)
-  if (resumen) {
-    doc.text(resumen, { align: 'left', lineGap: 4 })
-  } else {
-    doc.fillColor('#666666').text('(Sin resumen generado)', { align: 'left' })
-    doc.fillColor('#000000')
-  }
-  doc.moveDown()
-
+ 
   if (transcripcion) {
     doc.fontSize(12).text('Transcripción', { underline: true })
     doc.moveDown(0.5)
@@ -336,23 +463,17 @@ function escribirPdfActa(
       const texto = String(archivo.texto_ocr ?? '').trim()
       doc.fillColor('#000000').text(`${nombre} (${etiquetaTipoArchivoActa(tipo)})`)
       doc.moveDown(0.25)
-      if (tipo === 'imagen' && storageKey && !storageKey.includes('..') && !/[/\\]/.test(storageKey)) {
-        const filePath = path.join(uploadsDirPath, storageKey)
-        if (fs.existsSync(filePath)) {
-          try {
-            doc.image(filePath, { fit: [450, 280] })
-            doc.moveDown(0.5)
-          } catch {
-            // imagen no incrustable en PDF
-          }
-        }
-      }
+      await incrustarImagenEnActaPdf(doc, archivo, uploadsDirPath)
       doc.text(texto, { align: 'left', lineGap: 3 })
       doc.moveDown()
     }
   }
 
-  const otros = archivos.filter((a) => !String(a.texto_ocr ?? '').trim())
+  const otros = archivos.filter((a) => {
+    if (String(a.texto_ocr ?? '').trim()) return false
+    if (String(a.tipo ?? '') === 'imagen' && !incluirImagenActaActivo(a)) return false
+    return true
+  })
   if (otros.length > 0) {
     doc.fontSize(12).text('Otros adjuntos (sin texto extraído)', { underline: true })
     doc.moveDown(0.5)
@@ -363,17 +484,9 @@ function escribirPdfActa(
       const tipoRaw = String(archivo.tipo ?? '')
       const tipo = etiquetaTipoArchivoActa(tipoRaw)
       doc.text(`• ${nombre} (${tipo})`)
-      if (tipoRaw === 'imagen' && storageKey && !storageKey.includes('..') && !/[/\\]/.test(storageKey)) {
-        const filePath = path.join(uploadsDirPath, storageKey)
-        if (fs.existsSync(filePath)) {
-          try {
-            doc.moveDown(0.25)
-            doc.image(filePath, { fit: [450, 280] })
-            doc.moveDown(0.5)
-          } catch {
-            // imagen no incrustable en PDF
-          }
-        }
+      if (tipoRaw === 'imagen') {
+        doc.moveDown(0.25)
+        await incrustarImagenEnActaPdf(doc, archivo, uploadsDirPath)
       }
     }
     doc.fillColor('#000000')
@@ -390,6 +503,29 @@ const pool = mysql.createPool({
   waitForConnections: true,
   connectionLimit: 10,
 })
+
+function isUnknownColumnError(err: unknown, column: string): boolean {
+  const e = err as { code?: string; errno?: number; sqlMessage?: string }
+  if (e?.code === 'ER_BAD_FIELD_ERROR' || e?.errno === 1054) return true
+  const msg = String(e?.sqlMessage ?? err ?? '')
+  return msg.includes(column) && msg.includes('Unknown column')
+}
+
+async function ensureIncluirImagenActaColumn(): Promise<void> {
+  try {
+    await pool.query('SELECT incluir_imagen_acta FROM archivos_reunion LIMIT 0')
+    return
+  } catch (err) {
+    if (!isUnknownColumnError(err, 'incluir_imagen_acta')) throw err
+  }
+  await pool.query(`
+    ALTER TABLE archivos_reunion
+      ADD COLUMN incluir_imagen_acta TINYINT(1) NOT NULL DEFAULT 1
+      COMMENT '1=incluir foto en acta PDF'
+      AFTER texto_ocr
+  `)
+  console.log('[db] columna incluir_imagen_acta creada')
+}
 
 function isCorsOriginAllowed(origin: string | undefined): boolean {
   if (!origin) return true
@@ -534,8 +670,7 @@ app.get('/api/reuniones/:id', async (req: Request, res: Response) => {
       return
     }
     const [archivos] = await pool.query<RowDataPacket[]>(
-      `SELECT id, reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos, creado_en, texto_ocr
-       FROM archivos_reunion
+      `${ARCHIVOS_LIST_SELECT}
        WHERE reunion_id = ?
        ORDER BY creado_en DESC`,
       [id],
@@ -643,6 +778,43 @@ app.get('/api/reuniones/:id/transcripcion.pdf', async (req: Request, res: Respon
     }
   }
 })
+
+app.get('/api/reuniones/:id/resumen.txt', async (req: Request, res: Response) => {
+  const id = parseId(req.params.id)
+  if (id === null) {
+    res.status(400).json({ error: 'id inválido' })
+    return
+  }
+
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT titulo, resumen FROM reuniones WHERE id = ? LIMIT 1',
+      [id],
+    )
+    const row = rows[0]
+    if (!row) {
+      res.status(404).json({ error: 'reunión no encontrada' })
+      return
+    }
+
+    const cuerpo = formatearResumenParaDescarga(leerResumenAlmacenado(row.resumen))
+    if (!cuerpo) {
+      res.status(404).json({ error: 'no hay resumen' })
+      return
+    }
+
+    const titulo = String(row.titulo ?? 'reunion')
+    const filename = `resumen_${nombreArchivoDescarga(titulo, id, 'txt')}`
+
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
+    res.send(cuerpo)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    res.status(500).json({ error: message })
+  }
+})
+
 app.get('/api/reuniones/:id/acta.pdf', async (req: Request, res: Response) => {
   const id = parseId(req.params.id)
   if (id === null) {
@@ -662,7 +834,7 @@ app.get('/api/reuniones/:id/acta.pdf', async (req: Request, res: Response) => {
     }
 
     const [archivos] = await pool.query<RowDataPacket[]>(
-      `SELECT id, tipo, storage_key, texto_ocr FROM archivos_reunion
+      `SELECT id, tipo, storage_key, texto_ocr, incluir_imagen_acta FROM archivos_reunion
        WHERE reunion_id = ? ORDER BY creado_en ASC`,
       [id],
     )
@@ -684,7 +856,7 @@ app.get('/api/reuniones/:id/acta.pdf', async (req: Request, res: Response) => {
 
     const doc = new PDFDocument({ margin: 50 })
     doc.pipe(res)
-    escribirPdfActa(doc, reunion, archivos, uploadsDir)
+    await escribirPdfActa(doc, reunion, archivos, uploadsDir)
     doc.end()
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
@@ -714,7 +886,7 @@ app.delete('/api/reuniones/:id', async (req: Request, res: Response) => {
       const filePath = path.join(uploadsDir, storageKey)
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath)
 
-      const txtPath = whisperTxtPath(storageKey)
+      const txtPath = whisperTxtPath(uploadsDir, storageKey)
       if (fs.existsSync(txtPath)) fs.unlinkSync(txtPath)
     }
 
@@ -761,11 +933,19 @@ async function handleSubirArchivoReunion(req: Request, res: Response) {
     const tamanoBytes = req.file.size
     const tipo = clasificarTipoArchivo(mime, req.file.originalname)
 
-    const [insertFile] = await pool.query<ResultSetHeader>(
-      `INSERT INTO archivos_reunion (reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos)
-       VALUES (?, ?, ?, ?, ?, NULL)`,
-      [id, tipo, storageKey, mime, tamanoBytes],
-    )
+    const insertSql =
+      tipo === 'imagen'
+        ? `INSERT INTO archivos_reunion (reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos, incluir_imagen_acta)
+           VALUES (?, ?, ?, ?, ?, NULL, 1)`
+        : `INSERT INTO archivos_reunion (reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos)
+           VALUES (?, ?, ?, ?, ?, NULL)`
+    const [insertFile] = await pool.query<ResultSetHeader>(insertSql, [
+      id,
+      tipo,
+      storageKey,
+      mime,
+      tamanoBytes,
+    ])
 
     if (tipo === 'audio' || tipo === 'video') {
       await pool.query(
@@ -820,51 +1000,64 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
       return
     }
 
-
+    const todos = req.body?.todos === true || req.body?.todos === 'true'
     const archivoIdRaw = req.body?.archivoId
-    let storageKey = ''
 
-    if (archivoIdRaw != null && archivoIdRaw !== '') {
-      const archivoId = parseId(String(archivoIdRaw))
-      if (archivoId === null) {
-        res.status(400).json({ error: 'archivoId inválido' })
-        return
-      }
-      const [archivoRows] = await pool.query<RowDataPacket[]>(
-        `SELECT storage_key, tipo FROM archivos_reunion
-         WHERE id = ? AND reunion_id = ?
-         LIMIT 1`,
-        [archivoId, id],
-      )
-      if (!archivoRows[0]) {
-        res.status(404).json({ error: 'archivo no encontrado para esta reunión' })
-        return
-      }
-      const tipoArchivo = String(archivoRows[0].tipo ?? '')
-      if (tipoArchivo !== 'audio' && tipoArchivo !== 'video') {
-        res.status(400).json({ error: 'solo se puede transcribir archivos de audio o vídeo' })
-        return
-      }
-      storageKey = String(archivoRows[0].storage_key ?? '')
-    } else {
+    let storageKeys: string[] = []
+
+    if (todos) {
       const [archivoRows] = await pool.query<RowDataPacket[]>(
         `SELECT storage_key FROM archivos_reunion
          WHERE reunion_id = ? AND tipo IN ('audio', 'video')
-         ORDER BY creado_en DESC
-         LIMIT 1`,
+         ORDER BY creado_en ASC`,
         [id],
       )
-      storageKey = archivoRows[0] ? String(archivoRows[0].storage_key ?? '') : ''
-    }
-    if (!storageKey) {
-      res.status(400).json({ error: 'no hay audio ni vídeo subido para esta reunión' })
-      return
-    }
+      if (!archivoRows.length) {
+        res.status(400).json({ error: 'no hay audio ni vídeo subido para esta reunión' })
+        return
+      }
+      storageKeys = archivoRows.map((row) => String(row.storage_key ?? '')).filter(Boolean)
+    } else {
+      let storageKey = ''
 
-    const audioPath = path.join(uploadsDir, storageKey)
-    if (!fs.existsSync(audioPath)) {
-      res.status(404).json({ error: 'archivo de audio no encontrado en disco' })
-      return
+      if (archivoIdRaw != null && archivoIdRaw !== '') {
+        const archivoId = parseId(String(archivoIdRaw))
+        if (archivoId === null) {
+          res.status(400).json({ error: 'archivoId inválido' })
+          return
+        }
+        const [archivoRows] = await pool.query<RowDataPacket[]>(
+          `SELECT storage_key, tipo FROM archivos_reunion
+           WHERE id = ? AND reunion_id = ?
+           LIMIT 1`,
+          [archivoId, id],
+        )
+        if (!archivoRows[0]) {
+          res.status(404).json({ error: 'archivo no encontrado para esta reunión' })
+          return
+        }
+        const tipoArchivo = String(archivoRows[0].tipo ?? '')
+        if (tipoArchivo !== 'audio' && tipoArchivo !== 'video') {
+          res.status(400).json({ error: 'solo se puede transcribir archivos de audio o vídeo' })
+          return
+        }
+        storageKey = String(archivoRows[0].storage_key ?? '')
+      } else {
+        const [archivoRows] = await pool.query<RowDataPacket[]>(
+          `SELECT storage_key FROM archivos_reunion
+           WHERE reunion_id = ? AND tipo IN ('audio', 'video')
+           ORDER BY creado_en DESC
+           LIMIT 1`,
+          [id],
+        )
+        storageKey = archivoRows[0] ? String(archivoRows[0].storage_key ?? '') : ''
+      }
+
+      if (!storageKey) {
+        res.status(400).json({ error: 'no hay audio ni vídeo subido para esta reunión' })
+        return
+      }
+      storageKeys = [storageKey]
     }
 
     await pool.query(
@@ -872,15 +1065,18 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
       ['transcribiendo', id],
     )
 
-    await runWhisper(audioPath)
-
-    const txtPath = resolveWhisperTxtPath(storageKey)
-    if (!fs.existsSync(txtPath)) {
-      throw new Error('Whisper no generó el archivo de texto')
+    let transcripcion = ''
+    const partes: string[] = []
+    for (const storageKey of storageKeys) {
+      const texto = await transcribirStorageKey(storageKey)
+      if (storageKeys.length > 1) {
+        partes.push(`${encabezadoTranscripcionArchivo(storageKey)}\n\n${texto}`)
+      } else {
+        transcripcion = texto
+      }
     }
-    const transcripcion = fs.readFileSync(txtPath, 'utf8').trim()
-    if (!transcripcion) {
-      throw new Error('la transcripción está vacía')
+    if (partes.length > 0) {
+      transcripcion = partes.join('\n\n').trim()
     }
 
     await pool.query(
@@ -893,8 +1089,7 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
       [id],
     )
     const [archivos] = await pool.query<RowDataPacket[]>(
-      `SELECT id, reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos, creado_en, texto_ocr
-       FROM archivos_reunion WHERE reunion_id = ? ORDER BY creado_en DESC`,
+      `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
       [id],
     )
     const row = rows[0]
@@ -951,14 +1146,16 @@ app.post('/api/reuniones/:id/resumir', async (req: Request, res: Response) => {
       ['resumiendo', id],
     )
 
-    const resumen = generarResumenDesdeTranscripcion(transcripcion)
-    if (!resumen) {
+    const resumenData = generarResumenCompleto(transcripcion)
+    if (!resumenData.global && Object.keys(resumenData.porAudio).length === 0) {
       throw new Error('no se pudo generar el resumen')
     }
 
+    const resumenJson = JSON.stringify(resumenData)
+
     await pool.query(
       `UPDATE reuniones SET estado = ?, resumen = ?, error_mensaje = NULL, actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
-      ['completado', resumen, id],
+      ['completado', resumenJson, id],
     )
 
     const [rows] = await pool.query<RowDataPacket[]>(
@@ -966,8 +1163,7 @@ app.post('/api/reuniones/:id/resumir', async (req: Request, res: Response) => {
       [id],
     )
     const [archivos] = await pool.query<RowDataPacket[]>(
-      `SELECT id, reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos, creado_en, texto_ocr
-       FROM archivos_reunion WHERE reunion_id = ? ORDER BY creado_en DESC`,
+      `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
       [id],
     )
     const row = rows[0]
@@ -1085,7 +1281,7 @@ app.post(
       }
 
       await pool.query(
-        `UPDATE archivos_reunion SET texto_ocr = ? WHERE id = ? AND reunion_id = ?`,
+        `UPDATE archivos_reunion SET texto_ocr = ?, incluir_imagen_acta = 1 WHERE id = ? AND reunion_id = ?`,
         [textoOcr, archivoId, reunionId],
       )
 
@@ -1094,8 +1290,7 @@ app.post(
         [reunionId],
       )
       const [archivos] = await pool.query<RowDataPacket[]>(
-        `SELECT id, reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos, creado_en, texto_ocr
-         FROM archivos_reunion WHERE reunion_id = ? ORDER BY creado_en DESC`,
+        `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
         [reunionId],
       )
       const reunion = reunionRows[0]
@@ -1115,6 +1310,75 @@ app.post(
     }
   },
 )
+
+app.patch(
+  '/api/reuniones/:reunionId/archivos/:archivoId/incluir-imagen-acta',
+  async (req: Request, res: Response) => {
+    const reunionId = parseId(req.params.reunionId)
+    const archivoId = parseId(req.params.archivoId)
+    if (reunionId === null || archivoId === null) {
+      res.status(400).json({ error: 'id inválido' })
+      return
+    }
+
+    const raw = req.body?.incluirImagenActa
+    const incluir =
+      raw === true || raw === 'true' || raw === 1 || raw === '1'
+        ? 1
+        : raw === false || raw === 'false' || raw === 0 || raw === '0'
+          ? 0
+          : null
+    if (incluir === null) {
+      res.status(400).json({ error: 'incluirImagenActa debe ser true o false' })
+      return
+    }
+
+    try {
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT id, tipo, texto_ocr FROM archivos_reunion
+         WHERE id = ? AND reunion_id = ?
+         LIMIT 1`,
+        [archivoId, reunionId],
+      )
+      const row = rows[0]
+      if (!row) {
+        res.status(404).json({ error: 'archivo no encontrado' })
+        return
+      }
+      if (String(row.tipo ?? '') !== 'imagen') {
+        res.status(400).json({ error: 'solo aplica a imágenes' })
+        return
+      }
+      await pool.query(
+        `UPDATE archivos_reunion SET incluir_imagen_acta = ? WHERE id = ? AND reunion_id = ?`,
+        [incluir, archivoId, reunionId],
+      )
+
+      const [reunionRows] = await pool.query<RowDataPacket[]>(
+        'SELECT * FROM reuniones WHERE id = ? LIMIT 1',
+        [reunionId],
+      )
+      const [archivos] = await pool.query<RowDataPacket[]>(
+        `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
+        [reunionId],
+      )
+      const reunion = reunionRows[0]
+      if (!reunion) {
+        res.status(404).json({ error: 'reunión no encontrada' })
+        return
+      }
+      res.json({
+        ...reunion,
+        estado_etiqueta: etiquetaEstado(String(reunion.estado)),
+        archivos,
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      res.status(500).json({ error: message })
+    }
+  },
+)
+
 app.post(
   '/api/reuniones/:reunionId/archivos/:archivoId/texto',
   async (req: Request, res: Response) => {
@@ -1171,8 +1435,7 @@ app.post(
         [reunionId],
       )
       const [archivos] = await pool.query<RowDataPacket[]>(
-        `SELECT id, reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos, creado_en, texto_ocr
-         FROM archivos_reunion WHERE reunion_id = ? ORDER BY creado_en DESC`,
+        `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
         [reunionId],
       )
       const reunion = reunionRows[0]
@@ -1227,7 +1490,7 @@ app.delete(
         fs.unlinkSync(filePath)
       }
 
-      const txtPath = whisperTxtPath(storageKey)
+      const txtPath = whisperTxtPath(uploadsDir, storageKey)
       if (fs.existsSync(txtPath)) {
         fs.unlinkSync(txtPath)
       }
@@ -1242,8 +1505,7 @@ app.delete(
         [reunionId],
       )
       const [archivos] = await pool.query<RowDataPacket[]>(
-        `SELECT id, reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos, creado_en, texto_ocr
-         FROM archivos_reunion WHERE reunion_id = ? ORDER BY creado_en DESC`,
+        `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
         [reunionId],
       )
       const reunion = reunionRows[0]
@@ -1259,6 +1521,13 @@ app.delete(
       })
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
+      if (isUnknownColumnError(err, 'incluir_imagen_acta')) {
+        res.status(500).json({
+          error:
+            'Falta la columna incluir_imagen_acta en la base de datos. Reinicia el servidor API.',
+        })
+        return
+      }
       res.status(500).json({ error: message })
     }
   },
@@ -1269,6 +1538,13 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: message })
 })
 
-app.listen(PORT, () => {
-  console.log(`API http://localhost:${PORT}`)
-})
+void ensureIncluirImagenActaColumn()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`API http://localhost:${PORT}`)
+    })
+  })
+  .catch((err) => {
+    console.error('[db] no se pudo preparar incluir_imagen_acta:', err)
+    process.exit(1)
+  })

@@ -17,6 +17,8 @@ export interface ArchivoReunion {
   duracion_segundos: number | null
   creado_en: string
   texto_ocr?: string | null
+  /** 1 = incluir foto en acta.pdf cuando hay texto_ocr; 0 = solo texto */
+  incluir_imagen_acta?: boolean | number |  string | null
 }
 
 export interface Reunion {

@@ -14,14 +14,22 @@ import {
   downloadArchivo,
   extraerTextoImagen,
   extraerTextoDocumento,
+  setIncluirImagenActa,
   transcripcionTxtUrl,
   transcripcionPdfUrl,
   actaPdfUrl,
+  resumenTxtUrl,
   API_BASE,
 } from './api'
 import { etiquetaEstado } from './estados'
-import type { Reunion, ReunionListItem } from './types'
+import type { ArchivoReunion, Reunion, ReunionListItem } from './types'
 import './App.css'
+
+function incluirImagenActaMarcado(a: ArchivoReunion): boolean {
+  const v = a.incluir_imagen_acta
+  if (v === 0 || v === false || v === '0') return false
+  return true
+}
 
 function formatFecha(iso: string): string {
   try {
@@ -40,6 +48,36 @@ function formatBytes(bytes: number | null | undefined): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
+function nombreVisibleArchivo(storageKey: string): string {
+  const sinPrefijo = storageKey.replace(/^\d+-/, '')
+  return sinPrefijo || storageKey
+}
+
+interface ResumenAlmacenado {
+  global: string
+  porAudio: Record<string, string>
+}
+
+function leerResumenAlmacenado(raw: string | null | undefined): ResumenAlmacenado {
+  const t = String(raw ?? '').trim()
+  if (!t) return { global: '', porAudio: {} }
+  if (t.startsWith('{')) {
+    try {
+      const p = JSON.parse(t) as ResumenAlmacenado
+      return {
+        global: String(p.global ?? '').trim(),
+        porAudio:
+          p.porAudio && typeof p.porAudio === 'object' ? p.porAudio : {},
+      }
+    } catch {
+      return { global: t, porAudio: {} }
+    }
+  }
+  return {
+    global: t.replace(/========== Audio:\s*.+?\s*==========\s*/g, '').trim(),
+    porAudio: {},
+  }
+}
 
 function App() {
   const [apiOk, setApiOk] = useState<boolean | null>(null)
@@ -48,11 +86,17 @@ function App() {
   const [detalle, setDetalle] = useState<Reunion | null>(null)
   const [tituloNuevo, setTituloNuevo] = useState('')
   const [loading, setLoading] = useState(false)
+  const [guardandoIncluirId, setGuardandoIncluirId] = useState<number | null>(null)
   const [mensaje, setMensaje] = useState<{ tipo: 'ok' | 'error'; text: string } | null>(
     null,
   )
   const [grabando, setGrabando] = useState(false)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
+  const [mostrarResumenes, setMostrarResumenes] = useState(false)
+  /** En la web el OCR no se muestra hasta «Ver transcrito»; el PDF del acta lleva todo el texto. */
+  const [ocrVisiblePorArchivo, setOcrVisiblePorArchivo] = useState<
+    Record<number, boolean>
+  >({})
   const chunksRef = useRef<Blob[]>([])
   const mediaRefs = useRef<Map<number, HTMLMediaElement>>(new Map())
   const cargarLista = useCallback(async () => {
@@ -84,6 +128,8 @@ function App() {
 
   useEffect(() => {
     mediaRefs.current.clear()
+    setMostrarResumenes(false)
+    setOcrVisiblePorArchivo({})
   }, [selectedId])
 
   async function handleCrear(e: React.FormEvent) {
@@ -155,10 +201,36 @@ function App() {
     setLoading(true)
     setMensaje(null)
     try {
-      const actualizada = await transcribirReunion(selectedId, archivoId)
+      const actualizada = await transcribirReunion(
+        selectedId,
+        archivoId != null ? { archivoId } : {},
+      )
       setDetalle(actualizada)
       await cargarLista()
       setMensaje({ tipo: 'ok', text: 'Transcripción completada' })
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al transcribir',
+      })
+      await cargarDetalle(selectedId)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleTranscribirTodos() {
+    if (selectedId == null) return
+    setLoading(true)
+    setMensaje(null)
+    try {
+      const actualizada = await transcribirReunion(selectedId, { todos: true })
+      setDetalle(actualizada)
+      await cargarLista()
+      setMensaje({
+        tipo: 'ok',
+        text: 'Transcripción de todos los audios completada',
+      })
     } catch (err) {
       setMensaje({
         tipo: 'error',
@@ -268,6 +340,34 @@ function App() {
     }
   }
 
+  async function handleIncluirImagenActa(archivoId: number, incluir: boolean) {
+    if (selectedId == null || detalle == null) return
+    const detallePrevio = detalle
+    setGuardandoIncluirId(archivoId)
+    setMensaje(null)
+    setDetalle({
+      ...detalle,
+      archivos: (detalle.archivos ?? []).map((a) =>
+        a.id === archivoId
+          ? { ...a, incluir_imagen_acta: incluir ? 1 : 0 }
+          : a,
+      ),
+    })
+    try {
+      const actualizada = await setIncluirImagenActa(selectedId, archivoId, incluir)
+      setDetalle(actualizada)
+    } catch (err) {
+      setDetalle(detallePrevio)
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al guardar preferencia',
+      })
+      await cargarDetalle(selectedId)
+    } finally {
+      setGuardandoIncluirId(null)
+    }
+  }
+
   async function handleExtraerTextoDocumento(archivoId: number) {
     if (selectedId == null) return
     setLoading(true)
@@ -295,7 +395,8 @@ function App() {
       const actualizada = await resumirReunion(selectedId)
       setDetalle(actualizada)
       await cargarLista()
-      setMensaje({ tipo: 'ok', text: 'Resumen generado' })
+      setMostrarResumenes(false)
+      setMensaje({ tipo: 'ok', text: 'Resumen generado. Descárgalo o pulsa «Ver resúmenes».' })
     } catch (err) {
       setMensaje({
         tipo: 'error',
@@ -383,6 +484,11 @@ function App() {
       setLoading(false)
     }
   }
+
+  const audiosReunion =
+    detalle?.archivos?.filter((a) => a.tipo === 'audio' || a.tipo === 'video') ?? []
+  const resumenDatos = leerResumenAlmacenado(detalle?.resumen)
+  const hayResumenPorAudio = Object.keys(resumenDatos.porAudio).length > 0
 
   return (
     <div className="app">
@@ -544,7 +650,7 @@ function App() {
               <section className="upload-section">
                 <h3>Fotos y presentaciones</h3>
                 <p className="muted">
-                  Imágenes (pizarra, fotos) y documentos: PDF, PowerPoint (.pptx, .ppt).
+                  Imágenes y documentos: PDF, PowerPoint (.pptx, .ppt).
                 </p>
                 <label className="file-label">
                   <input
@@ -567,7 +673,7 @@ function App() {
                       const url = archivoUrl(detalle.id, a.id)
                       return (
                         <li key={a.id}>
-                          <strong>{a.storage_key}</strong>
+                          <strong>{nombreVisibleArchivo(a.storage_key)}</strong>
                           <span>
                             {a.tipo} · {formatBytes(a.tamano_bytes)} ·{' '}
                             {formatFecha(a.creado_en)}
@@ -607,19 +713,53 @@ function App() {
                               >
                                 {loading ? 'Extrayendo texto…' : 'Extraer texto (OCR)'}
                               </button>
+                              <label className="archivo-acta-opcion">
+                                <input
+                                  type="checkbox"
+                                  checked={incluirImagenActaMarcado(a)}
+                                  disabled={
+                                    apiOk !== true || guardandoIncluirId === a.id
+                                  }
+                                  onChange={(e) =>
+                                    void handleIncluirImagenActa(a.id, e.target.checked)
+                                  }
+                                />
+                                Incluir imagen en el acta (PDF)
+                                {guardandoIncluirId === a.id && (
+                                  <span className="muted"> guardando…</span>
+                                )}
+                              </label>
                               {a.texto_ocr?.trim() && (
-                                <div className="archivo-ocr-texto">
-                                  <h4>Texto de la imagen</h4>
-                                  <p className="text-block">{a.texto_ocr}</p>
-                                </div>
+                                <>
+                                  <button
+                                    type="button"
+                                    className="btn-secondary btn-archivo-accion"
+                                    onClick={() =>
+                                      setOcrVisiblePorArchivo((prev) => ({
+                                        ...prev,
+                                        [a.id]: !prev[a.id],
+                                      }))
+                                    }
+                                  >
+                                    {ocrVisiblePorArchivo[a.id]
+                                      ? 'Ocultar transcrito'
+                                      : 'Ver transcrito'}
+                                  </button>
+                                  {ocrVisiblePorArchivo[a.id] && (
+                                    <div className="archivo-ocr-texto">
+                                      <h4>Texto de la imagen</h4>
+                                      <p className="text-block">{a.texto_ocr}</p>
+                                    </div>
+                                  )}
+                                </>
                               )}
                             </>
                           )}
                           {a.tipo === 'documento' && (
                             <>
                               <p className="muted archivo-doc-hint">
-                                PDF o PowerPoint (.pptx). El formato .ppt antiguo no está
-                                soportado.
+                                PDF o PowerPoint (.pptx).
+                               
                               </p>
                               <button
                                 type="button"
@@ -632,10 +772,28 @@ function App() {
                                   : 'Extraer texto del documento'}
                               </button>
                               {a.texto_ocr?.trim() && (
-                                <div className="archivo-ocr-texto">
-                                  <h4>Texto del documento</h4>
-                                  <p className="text-block">{a.texto_ocr}</p>
-                                </div>
+                                <>
+                                  <button
+                                    type="button"
+                                    className="btn-secondary btn-archivo-accion"
+                                    onClick={() =>
+                                      setOcrVisiblePorArchivo((prev) => ({
+                                        ...prev,
+                                        [a.id]: !prev[a.id],
+                                      }))
+                                    }
+                                  >
+                                    {ocrVisiblePorArchivo[a.id]
+                                      ? 'Ocultar transcrito'
+                                      : 'Ver transcrito'}
+                                  </button>
+                                  {ocrVisiblePorArchivo[a.id] && (
+                                    <div className="archivo-ocr-texto">
+                                      <h4>Texto del documento</h4>
+                                      <p className="text-block">{a.texto_ocr}</p>
+                                    </div>
+                                  )}
+                                </>
                               )}
                             </>
                           )}
@@ -676,80 +834,133 @@ function App() {
                 )}
               </section>
               <section className="upload-section">
-                <h3>Transcripción</h3>
-                <p className="muted">
-                  En cada archivo usa «Transcribir este». El botón de abajo solo transcribe
-                  el audio más reciente.
-                </p>
-                <button
-                  type="button"
-                  className="btn-secondary"
-                  onClick={() => void handleTranscribir()}
-                  disabled={
-                    loading ||
-                    apiOk !== true ||
-                    !detalle.archivos?.length ||
-                    detalle.estado === 'transcribiendo'
-                  }
-                >
-                  {loading || detalle.estado === 'transcribiendo'
-                    ? 'Transcribiendo…'
-                    : 'Transcribir audio'}
-                </button>
-              </section>
-              <section className="upload-section">
                 <h3>Resumen</h3>
                 <p className="muted">
-                  Crea un texto corto a partir de la transcripción (primeras frases).
+                  Genera un texto corto «Ver resúmenes».
                 </p>
-                <button
-                  type="button"
-                  className="btn-secondary"
-                  onClick={() => void handleResumir()}
-                  disabled={
-                    loading ||
-                    apiOk !== true ||
-                    !detalle.transcripcion?.trim() ||
-                    detalle.estado === 'resumiendo'
-                  }
-                >
-                  {loading || detalle.estado === 'resumiendo'
-                    ? 'Generando resumen…'
-                    : 'Generar resumen'}
-                </button>
+                <div className="descarga-transcripcion-botones">
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => void handleResumir()}
+                    disabled={
+                      loading ||
+                      apiOk !== true ||
+                      !detalle.transcripcion?.trim() ||
+                      detalle.estado === 'resumiendo'
+                    }
+                  >
+                    {loading || detalle.estado === 'resumiendo'
+                      ? 'Generando resumen…'
+                      : 'Generar resumen'}
+                  </button>
+                  {detalle.resumen?.trim() && (
+                    <>
+                      <a
+                        className="btn-secondary descarga-link"
+                        href={resumenTxtUrl(detalle.id)}
+                        download
+                      >
+                        Descargar resumen (.txt)
+                      </a>
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => setMostrarResumenes((v) => !v)}
+                      >
+                        {mostrarResumenes ? 'Ocultar resúmenes' : 'Ver resúmenes'}
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                {mostrarResumenes && detalle.resumen?.trim() && (
+                  <div className="resumen-panel">
+                    {hayResumenPorAudio ? (
+                      <ul className="archivos resumen-por-audio-lista">
+                        {Object.entries(resumenDatos.porAudio).map(([nombre, texto]) => (
+                          <li key={nombre} className="resumen-audio-item">
+                            <strong>{nombre}</strong>
+                            <p className="text-block">{texto}</p>
+                          </li>
+                        ))}
+                      </ul>
+                    ) : (
+                      <p className="text-block">{resumenDatos.global}</p>
+                    )}
+                    {resumenDatos.global && hayResumenPorAudio && (
+                      <>
+                        <h4 className="pasos-subtitulo">Resumen de la reunión</h4>
+                        <p className="text-block">{resumenDatos.global}</p>
+                      </>
+                    )}
+                  </div>
+                )}
+              </section>
+              <section className="upload-section">
+                <h3>Transcripción</h3>
+                <p className="muted">
+                  «Transcribir este» en cada archivo → solo ese audio.
+                  {audiosReunion.length > 1 && (
+                    <> «Transcribir todos» une todos en un solo texto.</>
+                  )}{' '}
+                  Con transcripción lista, descarga .txt o PDF.
+                </p>
+                <div className="descarga-transcripcion-botones">
+                  {audiosReunion.length > 1 && (
+                    <button
+                      type="button"
+                      className="btn-secondary"
+                      onClick={() => void handleTranscribirTodos()}
+                      disabled={
+                        loading ||
+                        apiOk !== true ||
+                        detalle.estado === 'transcribiendo'
+                      }
+                    >
+                      {loading || detalle.estado === 'transcribiendo'
+                        ? 'Transcribiendo…'
+                        : `Transcribir todos`}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => void handleTranscribir()}
+                    disabled={
+                      loading ||
+                      apiOk !== true ||
+                      !audiosReunion.length ||
+                      detalle.estado === 'transcribiendo'
+                    }
+                  >
+                    {loading || detalle.estado === 'transcribiendo'
+                      ? 'Transcribiendo…'
+                      : audiosReunion.length > 1
+                        ? 'Transcribir audio más reciente'
+                        : 'Transcribir audio'}
+                  </button>
+                  {detalle.transcripcion?.trim() && (
+                    <>
+                      <a
+                        className="btn-secondary descarga-link"
+                        href={transcripcionTxtUrl(detalle.id)}
+                        download
+                      >
+                        Descargar (.txt)
+                      </a>
+                      <a
+                        className="btn-secondary descarga-link"
+                        href={transcripcionPdfUrl(detalle.id)}
+                        download
+                      >
+                        Descargar PDF
+                      </a>
+                    </>
+                  )}
+                </div>
               </section>
 
-              {detalle.resumen && (
-                <section className="futuro">
-                  <h3>Resumen</h3>
-                  <p className="text-block">{detalle.resumen}</p>
-                </section>
-              )}
-
-              {detalle.transcripcion?.trim() && (
-                <section className="upload-section descarga-transcripcion">
-                  <h3>Transcripción completa</h3>
-                  <p className="muted">
-                    El texto largo no se muestra aquí. Descárgalo para leerlo o archivarlo.
-                  </p>
-                  <div className="descarga-transcripcion-botones">
-                    <a
-                      className="btn-secondary descarga-link"
-                      href={transcripcionTxtUrl(detalle.id)}
-                      download
-                    >
-                      Descargar (.txt)
-                    </a>
-                    <a
-                      className="btn-secondary descarga-link"
-                      href={transcripcionPdfUrl(detalle.id)}
-                      download
-                    >
-                      Descargar PDF
-                    </a>
-                  </div>
-                </section>
-              )}
               {(detalle.resumen?.trim() ||
                 detalle.transcripcion?.trim() ||
                 detalle.archivos?.some((a) => a.texto_ocr?.trim()) ||
@@ -757,7 +968,7 @@ function App() {
                 <section className="upload-section descarga-transcripcion">
                   <h3>Acta de la reunión</h3>
                   <p className="muted">
-                    PDF con resumen, transcripción (si existe) y textos extraídos de fotos y
+                    PDF con transcripcion y textos extraídos de fotos y
                     documentos.
                   </p>
                   <div className="descarga-transcripcion-botones">

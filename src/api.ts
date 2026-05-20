@@ -62,12 +62,16 @@ export async function uploadArchivo(reunionId: number, file: File): Promise<Reun
 }
 export async function transcribirReunion(
   reunionId: number,
-  archivoId?: number,
+  options?: { archivoId?: number; todos?: boolean },
 ): Promise<Reunion> {
+  const body: { archivoId?: number; todos?: boolean } = {}
+  if (options?.archivoId != null) body.archivoId = options.archivoId
+  if (options?.todos) body.todos = true
+
   const res = await fetch(`${API_BASE}/api/reuniones/${reunionId}/transcribir`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(archivoId != null ? { archivoId } : {}),
+    body: JSON.stringify(body),
   })
   await parseJson<unknown>(res)
   return getReunion(reunionId)
@@ -143,6 +147,22 @@ export async function extraerTextoImagen(
   )
   return parseJson<Reunion>(res)
 }
+
+export async function setIncluirImagenActa(
+  reunionId: number,
+  archivoId: number,
+  incluir: boolean,
+): Promise<Reunion> {
+  const res = await fetch(
+    `${API_BASE}/api/reuniones/${reunionId}/archivos/${archivoId}/incluir-imagen-acta`,
+    {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ incluirImagenActa: incluir }),
+    },
+  )
+  return parseJson<Reunion>(res)
+}
 export async function extraerTextoDocumento(
   reunionId: number,
   archivoId: number,
@@ -162,6 +182,9 @@ export function transcripcionPdfUrl(reunionId: number): string {
 }
 export function actaPdfUrl(reunionId: number): string {
   return `${API_BASE}/api/reuniones/${reunionId}/acta.pdf`
+}
+export function resumenTxtUrl(reunionId: number): string {
+  return `${API_BASE}/api/reuniones/${reunionId}/resumen.txt`
 }
 
 
