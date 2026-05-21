@@ -32,6 +32,8 @@ export interface Reunion {
   duracion_segundos?: number | null
   transcripcion?: string | null
   resumen?: string | null
+  incluir_transcripcion_acta?: boolean | number | string | null
+  incluir_resumen_acta?: boolean | number | string | null
   error_mensaje?: string | null
   meta?: unknown
   archivos?: ArchivoReunion[]

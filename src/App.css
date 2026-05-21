@@ -519,3 +519,53 @@
 .resumen-por-audio-lista .resumen-audio-item:last-child {
   margin-bottom: 0;
 }
+
+.transcripcion-aviso {
+  margin-bottom: 1rem;
+  padding: 0.85rem 1rem;
+  border-radius: 8px;
+  border: 1px solid #93c5fd;
+  background: #eff6ff;
+  color: #1e3a5f;
+}
+
+.transcripcion-aviso-titulo {
+  margin: 0 0 0.35rem;
+  font-size: 0.95rem;
+}
+
+.transcripcion-aviso-tiempo,
+.transcripcion-aviso-nota {
+  margin: 0.25rem 0 0;
+  font-size: 0.9rem;
+}
+
+.transcripcion-aviso-nota {
+  font-style: italic;
+}
+
+.transcripcion-aviso-bar {
+  margin-top: 0.65rem;
+  height: 4px;
+  border-radius: 4px;
+  background: linear-gradient(90deg, #3b82f6 0%, #93c5fd 50%, #3b82f6 100%);
+  background-size: 200% 100%;
+  animation: transcripcion-bar 1.6s ease-in-out infinite;
+}
+
+@keyframes transcripcion-bar {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: -100% 0;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  .transcripcion-aviso {
+    background: #1e3a5f;
+    color: #e0f2fe;
+    border-color: #3b82f6;
+  }
+}

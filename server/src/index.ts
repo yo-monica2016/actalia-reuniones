@@ -16,6 +16,12 @@ import {
   transcribirStorageKey as transcribirArchivoLocal,
   whisperTxtPath,
 } from './transcripcion'
+import {
+  resumirTranscripcionOpenAi,
+  transcribirAudioOpenAi,
+  useOpenAiSummary,
+  useOpenAiTranscription,
+} from './openai'
 
 const PORT = Number(process.env.PORT) || 3001
 
@@ -106,7 +112,59 @@ function encabezadoTranscripcionArchivo(storageKey: string): string {
 }
 
 async function transcribirStorageKey(storageKey: string): Promise<string> {
+  if (!storageKey || storageKey.includes('..') || /[/\\]/.test(storageKey)) {
+    throw new Error('archivo de audio inválido')
+  }
+  const audioPath = path.join(uploadsDir, storageKey)
+  if (!fs.existsSync(audioPath)) {
+    throw new Error(`archivo de audio no encontrado: ${storageKey}`)
+  }
+
+  if (useOpenAiTranscription()) {
+    try {
+      console.log(`[transcripcion] OpenAI: ${storageKey}`)
+      const texto = await transcribirAudioOpenAi(audioPath)
+      const txtPath = whisperTxtPath(uploadsDir, storageKey)
+      fs.writeFileSync(txtPath, texto, 'utf8')
+      console.log(`[transcripcion] OpenAI terminó: ${storageKey}`)
+      return texto
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error(`[transcripcion] OpenAI falló (${storageKey}), usando Whisper local:`, msg)
+    }
+  }
+
   return transcribirArchivoLocal(uploadsDir, storageKey)
+}
+
+async function generarResumenCompletoAsync(
+  transcripcion: string,
+  tituloReunion?: string,
+): Promise<ResumenAlmacenado> {
+  if (useOpenAiSummary()) {
+    try {
+      console.log('[resumen] OpenAI')
+      const data = await resumirTranscripcionOpenAi(transcripcion, tituloReunion)
+      const porAudio: Record<string, string> = {}
+      for (const [k, v] of Object.entries(data.porAudio)) {
+        porAudio[nombreVisibleArchivo(k)] = v
+      }
+      let global = data.global.trim()
+      if (!global && Object.keys(porAudio).length === 1) {
+        global = Object.values(porAudio)[0] ?? ''
+      }
+      if (!global && Object.keys(porAudio).length > 1) {
+        global = Object.entries(porAudio)
+          .map(([k, v]) => `${k}: ${v}`)
+          .join('\n\n')
+      }
+      return { global, porAudio }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error('[resumen] OpenAI falló, usando resumen local:', msg)
+    }
+  }
+  return generarResumenCompleto(transcripcion)
 }
 
 function runOcr(imagePath: string): Promise<string> {
@@ -347,7 +405,13 @@ function incluirImagenActaActivo(archivo: RowDataPacket): boolean {
   if (v === null || v === undefined) return true
   return v !== 0 && v !== false && v !== '0'
 }
+function incluirTranscripcionActaActivo(reunion: RowDataPacket): boolean {
+  return Number(reunion.incluir_transcripcion_acta) === 1
+}
 
+function incluirResumenActaActivo(reunion: RowDataPacket): boolean {
+  return Number(reunion.incluir_resumen_acta) === 1
+}
 /** Imagen en PDF solo si el usuario la marcó (incluir_imagen_acta). */
 function debeIncrustarImagenEnActa(archivo: RowDataPacket): boolean {
   if (String(archivo.tipo ?? '') !== 'imagen') return false
@@ -443,13 +507,28 @@ async function escribirPdfActa(
   }
   doc.moveDown()
 
- 
-  if (transcripcion) {
+  if (incluirResumenActaActivo(reunion)) {
+    const resumenRaw = String(reunion.resumen ?? '').trim()
+    if (resumenRaw) {
+      const textoResumen = formatearResumenParaDescarga(
+        leerResumenAlmacenado(resumenRaw),
+      )
+      if (textoResumen) {
+        doc.fontSize(12).text('Resumen', { underline: true })
+        doc.moveDown(0.5)
+        doc.fontSize(11).text(textoResumen, { align: 'left', lineGap: 4 })
+        doc.moveDown()
+      }
+    }
+  }
+
+  if (incluirTranscripcionActaActivo(reunion) && transcripcion) {
     doc.fontSize(12).text('Transcripción', { underline: true })
     doc.moveDown(0.5)
     doc.fontSize(11).text(transcripcion, { align: 'left', lineGap: 4 })
     doc.moveDown()
   }
+ 
 
   const conTexto = archivos.filter((a) => String(a.texto_ocr ?? '').trim())
   if (conTexto.length > 0) {
@@ -525,6 +604,22 @@ async function ensureIncluirImagenActaColumn(): Promise<void> {
       AFTER texto_ocr
   `)
   console.log('[db] columna incluir_imagen_acta creada')
+}
+async function ensureActaOpcionesColumn(): Promise<void> {
+  try {
+    await pool.query(
+      'SELECT incluir_transcripcion_acta, incluir_resumen_acta FROM reuniones LIMIT 0',
+    )
+    return
+  } catch (err) {
+    if (!isUnknownColumnError(err, 'incluir_transcripcion_acta')) throw err
+  }
+  await pool.query(`
+    ALTER TABLE reuniones
+      ADD COLUMN incluir_transcripcion_acta TINYINT(1) NOT NULL DEFAULT 1,
+      ADD COLUMN incluir_resumen_acta TINYINT(1) NOT NULL DEFAULT 1
+  `)
+  console.log('[db] columnas incluir_transcripcion_acta e incluir_resumen_acta creadas')
 }
 
 function isCorsOriginAllowed(origin: string | undefined): boolean {
@@ -824,7 +919,7 @@ app.get('/api/reuniones/:id/acta.pdf', async (req: Request, res: Response) => {
 
   try {
     const [reunionRows] = await pool.query<RowDataPacket[]>(
-      'SELECT titulo, resumen, transcripcion, creado_en FROM reuniones WHERE id = ? LIMIT 1',
+      'SELECT titulo, resumen, transcripcion, creado_en, incluir_transcripcion_acta, incluir_resumen_acta FROM reuniones WHERE id = ? LIMIT 1',
       [id],
     )
     const reunion = reunionRows[0]
@@ -1126,7 +1221,7 @@ app.post('/api/reuniones/:id/resumir', async (req: Request, res: Response) => {
 
   try {
     const [reunionRows] = await pool.query<RowDataPacket[]>(
-      'SELECT id, transcripcion FROM reuniones WHERE id = ? LIMIT 1',
+      'SELECT id, titulo, transcripcion FROM reuniones WHERE id = ? LIMIT 1',
       [id],
     )
     const reunion = reunionRows[0]
@@ -1146,7 +1241,10 @@ app.post('/api/reuniones/:id/resumir', async (req: Request, res: Response) => {
       ['resumiendo', id],
     )
 
-    const resumenData = generarResumenCompleto(transcripcion)
+    const resumenData = await generarResumenCompletoAsync(
+      transcripcion,
+      String(reunion.titulo ?? ''),
+    )
     if (!resumenData.global && Object.keys(resumenData.porAudio).length === 0) {
       throw new Error('no se pudo generar el resumen')
     }
@@ -1190,6 +1288,7 @@ app.post('/api/reuniones/:id/resumir', async (req: Request, res: Response) => {
     res.status(500).json({ error: message })
   }
 })
+
 app.get('/api/reuniones/:reunionId/archivos/:archivoId', async (req: Request, res: Response) => {
   const reunionId = parseId(req.params.reunionId)
   const archivoId = parseId(req.params.archivoId)
@@ -1310,6 +1409,87 @@ app.post(
     }
   },
 )
+
+app.patch('/api/reuniones/:id/acta-opciones', async (req: Request, res: Response) => {
+  const reunionId = parseId(req.params.id)
+  if (reunionId === null) {
+    res.status(400).json({ error: 'id inválido' })
+    return
+  }
+
+  function parseBool(raw: unknown): number | null {
+    if (raw === true || raw === 'true' || raw === 1 || raw === '1') return 1
+    if (raw === false || raw === 'false' || raw === 0 || raw === '0') return 0
+    return null
+  }
+
+  const incTrans = parseBool(req.body?.incluirTranscripcionActa)
+  const incResumen = parseBool(req.body?.incluirResumenActa)
+  if (incTrans === null && incResumen === null) {
+    res.status(400).json({
+      error: 'indica incluirTranscripcionActa y/o incluirResumenActa (true/false)',
+    })
+    return
+  }
+
+  try {
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT id FROM reuniones WHERE id = ? LIMIT 1',
+      [reunionId],
+    )
+    if (!rows[0]) {
+      res.status(404).json({ error: 'reunión no encontrada' })
+      return
+    }
+
+    const sets: string[] = []
+    const vals: number[] = []
+    if (incTrans !== null) {
+      sets.push('incluir_transcripcion_acta = ?')
+      vals.push(incTrans)
+    }
+    if (incResumen !== null) {
+      sets.push('incluir_resumen_acta = ?')
+      vals.push(incResumen)
+    }
+    vals.push(reunionId)
+    await pool.query(
+      `UPDATE reuniones SET ${sets.join(', ')}, actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
+      vals,
+    )
+
+    const [reunionRows] = await pool.query<RowDataPacket[]>(
+      'SELECT * FROM reuniones WHERE id = ? LIMIT 1',
+      [reunionId],
+    )
+    const [archivos] = await pool.query<RowDataPacket[]>(
+      `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
+      [reunionId],
+    )
+    const reunion = reunionRows[0]
+    if (!reunion) {
+      res.status(404).json({ error: 'reunión no encontrada' })
+      return
+    }
+    res.json({
+      ...reunion,
+      estado_etiqueta: etiquetaEstado(String(reunion.estado)),
+      archivos,
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    if (
+      isUnknownColumnError(err, 'incluir_transcripcion_acta') ||
+      isUnknownColumnError(err, 'incluir_resumen_acta')
+    ) {
+      res.status(500).json({
+        error: 'Faltan columnas de opciones del acta. Reinicia el servidor API.',
+      })
+      return
+    }
+    res.status(500).json({ error: message })
+  }
+})
 
 app.patch(
   '/api/reuniones/:reunionId/archivos/:archivoId/incluir-imagen-acta',
@@ -1538,13 +1718,13 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: message })
 })
 
-void ensureIncluirImagenActaColumn()
+void Promise.all([ensureIncluirImagenActaColumn(), ensureActaOpcionesColumn()])
   .then(() => {
     app.listen(PORT, () => {
       console.log(`API http://localhost:${PORT}`)
     })
   })
   .catch((err) => {
-    console.error('[db] no se pudo preparar incluir_imagen_acta:', err)
+    console.error('[db] no se pudieron preparar columnas del acta:', err)
     process.exit(1)
   })

@@ -15,6 +15,7 @@ import {
   extraerTextoImagen,
   extraerTextoDocumento,
   setIncluirImagenActa,
+  setActaOpciones,
   transcripcionTxtUrl,
   transcripcionPdfUrl,
   actaPdfUrl,
@@ -29,6 +30,27 @@ function incluirImagenActaMarcado(a: ArchivoReunion): boolean {
   const v = a.incluir_imagen_acta
   if (v === 0 || v === false || v === '0') return false
   return true
+}
+
+function incluirTranscripcionActaMarcado(r: Reunion): boolean {
+  const v = r.incluir_transcripcion_acta
+  if (v === 0 || v === false || v === '0') return false
+  return v === undefined || v === null || v === 1 || v === true || v === '1'
+}
+
+function incluirResumenActaMarcado(r: Reunion): boolean {
+  const v = r.incluir_resumen_acta
+  if (v === 0 || v === false || v === '0') return false
+  return v === undefined || v === null || v === 1 || v === true || v === '1'
+}
+
+function etiquetaTranscribiendo(
+  activa: boolean,
+  minutos: number,
+  textoNormal: string,
+): string {
+  if (!activa) return textoNormal
+  return minutos > 0 ? `Transcribiendo… (${minutos} min)` : 'Transcribiendo…'
 }
 
 function formatFecha(iso: string): string {
@@ -97,6 +119,12 @@ function App() {
   const [ocrVisiblePorArchivo, setOcrVisiblePorArchivo] = useState<
     Record<number, boolean>
   >({})
+  const [transcripcionActiva, setTranscripcionActiva] = useState(false)
+  const [transcripcionMinutos, setTranscripcionMinutos] = useState(0)
+  const [transcripcionNotaExtra, setTranscripcionNotaExtra] = useState<string | null>(
+    null,
+  )
+  const transcripcionInicioRef = useRef<number | null>(null)
   const chunksRef = useRef<Blob[]>([])
   const mediaRefs = useRef<Map<number, HTMLMediaElement>>(new Map())
   const cargarLista = useCallback(async () => {
@@ -131,6 +159,29 @@ function App() {
     setMostrarResumenes(false)
     setOcrVisiblePorArchivo({})
   }, [selectedId])
+
+  useEffect(() => {
+    if (!transcripcionActiva) return
+
+    const tick = () => {
+      const inicio = transcripcionInicioRef.current
+      if (inicio == null) return
+      const min = Math.floor((Date.now() - inicio) / 60000)
+      setTranscripcionMinutos(min)
+      if (min === 5) {
+        setTranscripcionNotaExtra('Seguimos con tu audio. Gracias por esperar.')
+      }
+      if (min === 15) {
+        setTranscripcionNotaExtra(
+          'Tu transcripción sigue en curso. No hemos olvidado tu archivo.',
+        )
+      }
+    }
+
+    tick()
+    const id = window.setInterval(tick, 300000)
+    return () => window.clearInterval(id)
+  }, [transcripcionActiva])
 
   async function handleCrear(e: React.FormEvent) {
     e.preventDefault()
@@ -196,8 +247,23 @@ function App() {
     }
   }
 
+  function iniciarAvisoTranscripcion() {
+    transcripcionInicioRef.current = Date.now()
+    setTranscripcionMinutos(0)
+    setTranscripcionNotaExtra(null)
+    setTranscripcionActiva(true)
+  }
+
+  function finalizarAvisoTranscripcion() {
+    transcripcionInicioRef.current = null
+    setTranscripcionActiva(false)
+    setTranscripcionMinutos(0)
+    setTranscripcionNotaExtra(null)
+  }
+
   async function handleTranscribir(archivoId?: number) {
     if (selectedId == null) return
+    iniciarAvisoTranscripcion()
     setLoading(true)
     setMensaje(null)
     try {
@@ -216,11 +282,13 @@ function App() {
       await cargarDetalle(selectedId)
     } finally {
       setLoading(false)
+      finalizarAvisoTranscripcion()
     }
   }
 
   async function handleTranscribirTodos() {
     if (selectedId == null) return
+    iniciarAvisoTranscripcion()
     setLoading(true)
     setMensaje(null)
     try {
@@ -239,6 +307,7 @@ function App() {
       await cargarDetalle(selectedId)
     } finally {
       setLoading(false)
+      finalizarAvisoTranscripcion()
     }
   }
 
@@ -365,6 +434,30 @@ function App() {
       await cargarDetalle(selectedId)
     } finally {
       setGuardandoIncluirId(null)
+    }
+  }
+  async function handleActaOpcion(
+    campo: 'transcripcion' | 'resumen',
+    incluir: boolean,
+  ) {
+    if (selectedId == null || !detalle) return
+    setLoading(true)
+    setMensaje(null)
+    try {
+      const actualizada = await setActaOpciones(selectedId, {
+        ...(campo === 'transcripcion'
+          ? { incluirTranscripcionActa: incluir }
+          : { incluirResumenActa: incluir }),
+      })
+      setDetalle(actualizada)
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al guardar opciones del acta',
+      })
+      await cargarDetalle(selectedId)
+    } finally {
+      setLoading(false)
     }
   }
 
@@ -598,11 +691,26 @@ function App() {
                 </div>
               )}
 
-              <dl className="meta-grid">
-                <div>
-                  <dt>ID</dt>
-                  <dd>{detalle.id}</dd>
+              {transcripcionActiva && (
+                <div className="transcripcion-aviso" role="status">
+                  <p className="transcripcion-aviso-titulo">
+                    Estamos transcribiendo tu audio. En archivos largos puede tardar
+                    un rato. No cierres esta página.
+                  </p>
+                  {transcripcionMinutos > 0 && (
+                    <p className="transcripcion-aviso-tiempo">
+                      Lleva {transcripcionMinutos} min.
+                    </p>
+                  )}
+                  {transcripcionNotaExtra && (
+                    <p className="transcripcion-aviso-nota">{transcripcionNotaExtra}</p>
+                  )}
+                  <div className="transcripcion-aviso-bar" aria-hidden="true" />
                 </div>
+              )}
+
+              <dl className="meta-grid">
+               
                 <div>
                   <dt>Creada</dt>
                   <dd>{formatFecha(detalle.creado_en)}</dd>
@@ -816,7 +924,11 @@ function App() {
                                 detalle.estado === 'transcribiendo'
                               }
                             >
-                              Transcribir este
+                              {etiquetaTranscribiendo(
+                                transcripcionActiva,
+                                transcripcionMinutos,
+                                'Transcribir este',
+                              )}
                             </button>
                           )}
                           <button
@@ -918,9 +1030,13 @@ function App() {
                         detalle.estado === 'transcribiendo'
                       }
                     >
-                      {loading || detalle.estado === 'transcribiendo'
-                        ? 'Transcribiendo…'
-                        : `Transcribir todos`}
+                      {etiquetaTranscribiendo(
+                        transcripcionActiva,
+                        transcripcionMinutos,
+                        loading || detalle.estado === 'transcribiendo'
+                          ? 'Transcribiendo…'
+                          : 'Transcribir todos',
+                      )}
                     </button>
                   )}
                   <button
@@ -934,11 +1050,15 @@ function App() {
                       detalle.estado === 'transcribiendo'
                     }
                   >
-                    {loading || detalle.estado === 'transcribiendo'
-                      ? 'Transcribiendo…'
-                      : audiosReunion.length > 1
-                        ? 'Transcribir audio más reciente'
-                        : 'Transcribir audio'}
+                    {etiquetaTranscribiendo(
+                      transcripcionActiva,
+                      transcripcionMinutos,
+                      loading || detalle.estado === 'transcribiendo'
+                        ? 'Transcribiendo…'
+                        : audiosReunion.length > 1
+                          ? 'Transcribir audio más reciente'
+                          : 'Transcribir audio',
+                    )}
                   </button>
                   {detalle.transcripcion?.trim() && (
                     <>
@@ -968,18 +1088,44 @@ function App() {
                 <section className="upload-section descarga-transcripcion">
                   <h3>Acta de la reunión</h3>
                   <p className="muted">
-                    PDF con transcripcion y textos extraídos de fotos y
-                    documentos.
+                    Elige qué incluir en el PDF. Las fotos siguen con su
+                    checkbox en cada imagen.
                   </p>
+                  <label className="archivo-acta-opcion">
+                    <input
+                      type="checkbox"
+                      checked={incluirTranscripcionActaMarcado(detalle)}
+                      disabled={
+                        loading || apiOk !== true || !detalle.transcripcion?.trim()
+                      }
+                      onChange={(e) =>
+                        void handleActaOpcion('transcripcion', e.target.checked)
+                      }
+                    />
+                    Incluir transcripción en el acta (PDF)
+                  </label>
+                  <label className="archivo-acta-opcion">
+                    <input
+                      type="checkbox"
+                      checked={incluirResumenActaMarcado(detalle)}
+                      disabled={loading || apiOk !== true || !detalle.resumen?.trim()}
+                      onChange={(e) =>
+                        void handleActaOpcion('resumen', e.target.checked)
+                      }
+                    />
+                    Incluir resumen en el acta (PDF)
+                  </label>
                   <div className="descarga-transcripcion-botones">
                     <a
                       className="btn-secondary descarga-link"
-                      href={actaPdfUrl(detalle.id)}
+                      href={`${actaPdfUrl(detalle.id)}?v=${encodeURIComponent(detalle.actualizado_en)}`}
                       download
                     >
                       Descargar acta (PDF)
                     </a>
                   </div>
+
+
                 </section>
               )}
               {detalle.estado === 'borrador' && !detalle.archivos?.length && (

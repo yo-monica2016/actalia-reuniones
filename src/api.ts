@@ -163,6 +163,23 @@ export async function setIncluirImagenActa(
   )
   return parseJson<Reunion>(res)
 }
+export async function setActaOpciones(
+  reunionId: number,
+  opciones: {
+    incluirTranscripcionActa?: boolean
+    incluirResumenActa?: boolean
+  },
+): Promise<Reunion> {
+  const res = await fetch(`${API_BASE}/api/reuniones/${reunionId}/acta-opciones`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      incluirTranscripcionActa: opciones.incluirTranscripcionActa,
+      incluirResumenActa: opciones.incluirResumenActa,
+    }),
+  })
+  return parseJson<Reunion>(res)
+}
 export async function extraerTextoDocumento(
   reunionId: number,
   archivoId: number,
