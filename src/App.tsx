@@ -20,10 +20,19 @@ import {
   transcripcionPdfUrl,
   actaPdfUrl,
   resumenTxtUrl,
-  API_BASE,
+  API_BASE_DISPLAY,
 } from './api'
+import { RenombrarHablantes } from './components/RenombrarHablantes'
+import { TranscripcionPorHablante } from './components/TranscripcionPorHablante'
+import { speakersUnicos } from './transcripcionView'
+import { leerResumenAlmacenado } from './resumen'
 import { etiquetaEstado } from './estados'
-import type { ArchivoReunion, Reunion, ReunionListItem } from './types'
+import type {
+  ArchivoReunion,
+  Reunion,
+  ReunionListItem,
+  TranscripcionJsonGuardada,
+} from './types'
 import './App.css'
 
 function incluirImagenActaMarcado(a: ArchivoReunion): boolean {
@@ -42,6 +51,40 @@ function incluirResumenActaMarcado(r: Reunion): boolean {
   const v = r.incluir_resumen_acta
   if (v === 0 || v === false || v === '0') return false
   return v === undefined || v === null || v === 1 || v === true || v === '1'
+}
+
+function parseTranscripcionJson(
+  raw: Reunion['transcripcion_json'],
+): TranscripcionJsonGuardada | null {
+  if (raw == null || raw === '') return null
+  try {
+    const j = typeof raw === 'string' ? JSON.parse(raw) : raw
+    if (j && typeof j === 'object' && Array.isArray(j.segmentos)) {
+      const hablantes =
+        j.hablantes && typeof j.hablantes === 'object' && !Array.isArray(j.hablantes)
+          ? (j.hablantes as TranscripcionJsonGuardada['hablantes'])
+          : undefined
+      return {
+        diarizada: Boolean(j.diarizada),
+        segmentos: j.segmentos,
+        hablantes,
+      }
+    }
+  } catch {
+    /* ignorar JSON inválido */
+  }
+  return null
+}
+
+function mensajeTrasTranscripcion(r: Reunion): string {
+  if (r.transcripcion_aviso?.trim()) {
+    return r.transcripcion_aviso.trim()
+  }
+  const json = parseTranscripcionJson(r.transcripcion_json)
+  if (json?.diarizada) {
+    return 'Transcripción completada con voces separadas (Persona A, Persona B…).'
+  }
+  return 'Transcripción completada'
 }
 
 function etiquetaTranscribiendo(
@@ -73,32 +116,6 @@ function formatBytes(bytes: number | null | undefined): string {
 function nombreVisibleArchivo(storageKey: string): string {
   const sinPrefijo = storageKey.replace(/^\d+-/, '')
   return sinPrefijo || storageKey
-}
-
-interface ResumenAlmacenado {
-  global: string
-  porAudio: Record<string, string>
-}
-
-function leerResumenAlmacenado(raw: string | null | undefined): ResumenAlmacenado {
-  const t = String(raw ?? '').trim()
-  if (!t) return { global: '', porAudio: {} }
-  if (t.startsWith('{')) {
-    try {
-      const p = JSON.parse(t) as ResumenAlmacenado
-      return {
-        global: String(p.global ?? '').trim(),
-        porAudio:
-          p.porAudio && typeof p.porAudio === 'object' ? p.porAudio : {},
-      }
-    } catch {
-      return { global: t, porAudio: {} }
-    }
-  }
-  return {
-    global: t.replace(/========== Audio:\s*.+?\s*==========\s*/g, '').trim(),
-    porAudio: {},
-  }
 }
 
 function App() {
@@ -273,7 +290,7 @@ function App() {
       )
       setDetalle(actualizada)
       await cargarLista()
-      setMensaje({ tipo: 'ok', text: 'Transcripción completada' })
+      setMensaje({ tipo: 'ok', text: mensajeTrasTranscripcion(actualizada) })
     } catch (err) {
       setMensaje({
         tipo: 'error',
@@ -297,7 +314,7 @@ function App() {
       await cargarLista()
       setMensaje({
         tipo: 'ok',
-        text: 'Transcripción de todos los audios completada',
+        text: mensajeTrasTranscripcion(actualizada),
       })
     } catch (err) {
       setMensaje({
@@ -582,6 +599,7 @@ function App() {
     detalle?.archivos?.filter((a) => a.tipo === 'audio' || a.tipo === 'video') ?? []
   const resumenDatos = leerResumenAlmacenado(detalle?.resumen)
   const hayResumenPorAudio = Object.keys(resumenDatos.porAudio).length > 0
+  const hayResumenTemas = resumenDatos.temas.length > 0
 
   return (
     <div className="app">
@@ -602,7 +620,7 @@ function App() {
 
       {apiOk === false && (
         <div className="alert alert-error">
-          No se puede conectar al API en <strong>{API_BASE}</strong>. Arranca el servidor:{' '}
+          No se puede conectar al API en <strong>{API_BASE_DISPLAY}</strong>. Arranca el servidor:{' '}
           <code>cd server</code> → <code>npm run dev</code>
         </div>
       )}
@@ -988,22 +1006,39 @@ function App() {
 
                 {mostrarResumenes && detalle.resumen?.trim() && (
                   <div className="resumen-panel">
-                    {hayResumenPorAudio ? (
-                      <ul className="archivos resumen-por-audio-lista">
-                        {Object.entries(resumenDatos.porAudio).map(([nombre, texto]) => (
-                          <li key={nombre} className="resumen-audio-item">
-                            <strong>{nombre}</strong>
-                            <p className="text-block">{texto}</p>
-                          </li>
-                        ))}
-                      </ul>
-                    ) : (
-                      <p className="text-block">{resumenDatos.global}</p>
-                    )}
-                    {resumenDatos.global && hayResumenPorAudio && (
+                    {hayResumenTemas && (
                       <>
-                        <h4 className="pasos-subtitulo">Resumen de la reunión</h4>
-                        <p className="text-block">{resumenDatos.global}</p>
+                        <h4 className="pasos-subtitulo">Temas tratados</h4>
+                        <ul className="resumen-temas-lista">
+                          {resumenDatos.temas.map((tema, i) => (
+                            <li key={`${tema.titulo}-${i}`} className="resumen-tema-item">
+                              <h5 className="resumen-tema-titulo">{tema.titulo}</h5>
+                              <p className="text-block">{tema.resumen}</p>
+                            </li>
+                          ))}
+                        </ul>
+                      </>
+                    )}
+                    {resumenDatos.global &&
+                      (hayResumenTemas || !hayResumenPorAudio) && (
+                        <>
+                          <h4 className="pasos-subtitulo">
+                            {hayResumenTemas ? 'Síntesis general' : 'Resumen'}
+                          </h4>
+                          <p className="text-block">{resumenDatos.global}</p>
+                        </>
+                      )}
+                    {hayResumenPorAudio && (
+                      <>
+                        <h4 className="pasos-subtitulo">Por archivo de audio</h4>
+                        <ul className="archivos resumen-por-audio-lista">
+                          {Object.entries(resumenDatos.porAudio).map(([nombre, texto]) => (
+                            <li key={nombre} className="resumen-audio-item">
+                              <strong>{nombre}</strong>
+                              <p className="text-block">{texto}</p>
+                            </li>
+                          ))}
+                        </ul>
                       </>
                     )}
                   </div>
@@ -1018,6 +1053,52 @@ function App() {
                   )}{' '}
                   Con transcripción lista, descarga .txt o PDF.
                 </p>
+                {detalle.transcripcion_aviso?.trim() && (
+                  <p className="transcripcion-aviso-diarizacion" role="status">
+                    {detalle.transcripcion_aviso}
+                  </p>
+                )}
+                {parseTranscripcionJson(detalle.transcripcion_json)?.diarizada &&
+                  !detalle.transcripcion_aviso?.trim() && (
+                    <p className="transcripcion-ok-diarizacion" role="status">
+                      Voces separadas (Persona A, B…). Revisa por hablante abajo; el
+                      modelo puede agrupar o separar voces de forma automática.
+                    </p>
+                  )}
+                {(() => {
+                  const json = parseTranscripcionJson(detalle.transcripcion_json)
+                  if (json?.diarizada && json.segmentos.length > 0) {
+                    return (
+                      <>
+                        <RenombrarHablantes
+                          reunionId={detalle.id}
+                          speakers={speakersUnicos(json.segmentos)}
+                          hablantesIniciales={json.hablantes}
+                          onGuardado={(r) => setDetalle(r)}
+                          disabled={loading}
+                        />
+                        <TranscripcionPorHablante json={json} />
+                      </>
+                    )
+                  }
+                  if (detalle.transcripcion?.trim()) {
+                    return (
+                      <pre className="transcripcion-preview">
+                        {detalle.transcripcion}
+                      </pre>
+                    )
+                  }
+                  return null
+                })()}
+                {parseTranscripcionJson(detalle.transcripcion_json)?.diarizada &&
+                  detalle.transcripcion?.trim() && (
+                    <details className="transcripcion-plano-extra">
+                      <summary className="muted">Ver texto plano completo (todas las voces)</summary>
+                      <pre className="transcripcion-preview transcripcion-preview--completo">
+                        {detalle.transcripcion}
+                      </pre>
+                    </details>
+                  )}
                 <div className="descarga-transcripcion-botones">
                   {audiosReunion.length > 1 && (
                     <button

@@ -21,6 +21,23 @@ export interface ArchivoReunion {
   incluir_imagen_acta?: boolean | number |  string | null
 }
 
+export interface SegmentoTranscripcion {
+  speaker: string
+  start: number
+  end: number
+  text: string
+}
+
+/** Clave = speaker del modelo (A, B…); valor = nombre mostrado (ej. Luis). */
+export type MapaHablantes = Record<string, string>
+
+export interface TranscripcionJsonGuardada {
+  diarizada: boolean
+  segmentos: SegmentoTranscripcion[]
+  hablantes?: MapaHablantes
+}
+
+
 export interface Reunion {
   id: number
   titulo: string
@@ -31,6 +48,8 @@ export interface Reunion {
   mime_tipo?: string | null
   duracion_segundos?: number | null
   transcripcion?: string | null
+  transcripcion_json?: string | TranscripcionJsonGuardada | null
+  transcripcion_aviso?: string | null
   resumen?: string | null
   incluir_transcripcion_acta?: boolean | number | string | null
   incluir_resumen_acta?: boolean | number | string | null

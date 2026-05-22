@@ -1,4 +1,4 @@
-import dotenv from 'dotenv'
+import './loadEnv'
 import path from 'node:path'
 import fs from 'node:fs'
 import { spawn } from 'node:child_process'
@@ -17,10 +17,25 @@ import {
   whisperTxtPath,
 } from './transcripcion'
 import {
+  limpiarTemporales,
+  transcribirAudioConPipeline,
+} from './audioPipeline'
+import {
+  normalizarMapaHablantes,
+  parseTranscripcionJsonAlmacenado,
+  segmentosATextoPlano,
+} from './hablantes'
+import {
+  formatearResumenParaDescarga,
+  leerResumenAlmacenado,
+  type ResumenAlmacenado,
+} from './resumen'
+import {
+  OPENAI_MAX_AUDIO_BYTES,
   resumirTranscripcionOpenAi,
-  transcribirAudioOpenAi,
   useOpenAiSummary,
   useOpenAiTranscription,
+  type SegmentoDiarizado,
 } from './openai'
 
 const PORT = Number(process.env.PORT) || 3001
@@ -60,7 +75,6 @@ function clasificarTipoArchivo(mime: string, originalname: string): string {
 }
 
 const serverRoot = path.join(__dirname, '..')
-dotenv.config({ path: path.join(serverRoot, '.env') })
 
 const uploadsDir = path.join(serverRoot, 'uploads')
 const projectTessdataDir = path.join(serverRoot, 'tessdata')
@@ -110,8 +124,21 @@ function encabezadoTranscripcionArchivo(storageKey: string): string {
   const nombre = storageKey.replace(/^\d+-/, '') || storageKey
   return `========== Audio: ${nombre} ==========`
 }
+interface TranscripcionResult {
+  texto: string
+  segmentos: SegmentoDiarizado[]
+  diarizada: boolean
+  aviso?: string
+}
 
-async function transcribirStorageKey(storageKey: string): Promise<string> {
+interface TranscripcionJsonAlmacenada {
+  diarizada: boolean
+  segmentos: SegmentoDiarizado[]
+  hablantes?: Record<string, string>
+}
+
+async function transcribirStorageKey(storageKey: string): Promise<TranscripcionResult> {
+  console.log(`[transcripcion] entrada storageKey=${storageKey}`)
   if (!storageKey || storageKey.includes('..') || /[/\\]/.test(storageKey)) {
     throw new Error('archivo de audio inválido')
   }
@@ -120,23 +147,54 @@ async function transcribirStorageKey(storageKey: string): Promise<string> {
     throw new Error(`archivo de audio no encontrado: ${storageKey}`)
   }
 
+  const stat = fs.statSync(audioPath)
+  const tamanoMb = stat.size / (1024 * 1024)
+  const demasiadoGrande = stat.size > OPENAI_MAX_AUDIO_BYTES
+  const avisoTamano = demasiadoGrande
+    ? `Este audio pesa ${tamanoMb.toFixed(1)} MB. Se procesará con compresión y/o fragmentos antes de transcribir.`
+    : undefined
+
   if (useOpenAiTranscription()) {
+    const temporales: string[] = []
     try {
-      console.log(`[transcripcion] OpenAI: ${storageKey}`)
-      const texto = await transcribirAudioOpenAi(audioPath)
+      console.log(`[transcripcion] pipeline OpenAI (comprimir/trocear/diarize): ${storageKey}`)
+      const resultado = await transcribirAudioConPipeline(audioPath, uploadsDir)
+      temporales.push(...resultado.temporales)
       const txtPath = whisperTxtPath(uploadsDir, storageKey)
-      fs.writeFileSync(txtPath, texto, 'utf8')
-      console.log(`[transcripcion] OpenAI terminó: ${storageKey}`)
-      return texto
+      fs.writeFileSync(txtPath, resultado.texto, 'utf8')
+      console.log(`[transcripcion] pipeline terminó: ${storageKey}`)
+      const aviso = [avisoTamano, resultado.aviso].filter(Boolean).join(' ') || undefined
+      return {
+        texto: resultado.texto,
+        segmentos: resultado.segmentos,
+        diarizada: resultado.diarizada,
+        aviso,
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      console.error(`[transcripcion] OpenAI falló (${storageKey}), usando Whisper local:`, msg)
+      console.error(`[transcripcion] pipeline OpenAI falló (${storageKey}):`, msg)
+      if (msg.includes('ffmpeg') || msg.includes('FFmpeg')) {
+        throw new Error(
+          'FFmpeg no está disponible. Instálalo y añádelo al PATH, o define FFMPEG_PATH en server/.env',
+        )
+      }
+    } finally {
+      limpiarTemporales(temporales)
     }
   }
 
-  return transcribirArchivoLocal(uploadsDir, storageKey)
+  const texto = await transcribirArchivoLocal(uploadsDir, storageKey)
+  const txtPath = whisperTxtPath(uploadsDir, storageKey)
+  if (!fs.existsSync(txtPath)) {
+    fs.writeFileSync(txtPath, texto, 'utf8')
+  }
+  return {
+    texto,
+    segmentos: [],
+    diarizada: false,
+    aviso: avisoTamano,
+  }
 }
-
 async function generarResumenCompletoAsync(
   transcripcion: string,
   tituloReunion?: string,
@@ -158,7 +216,11 @@ async function generarResumenCompletoAsync(
           .map(([k, v]) => `${k}: ${v}`)
           .join('\n\n')
       }
-      return { global, porAudio }
+      return {
+        global,
+        temas: data.temas,
+        porAudio,
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       console.error('[resumen] OpenAI falló, usando resumen local:', msg)
@@ -288,11 +350,6 @@ function generarResumenDesdeTranscripcion(transcripcion: string): string {
   return `${limpio.slice(0, maxChars).trim()}…`
 }
 
-interface ResumenAlmacenado {
-  global: string
-  porAudio: Record<string, string>
-}
-
 function extraerBloquesTranscripcion(transcripcion: string): { nombre: string; cuerpo: string }[] {
   const t = transcripcion.replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim()
   if (!t) return []
@@ -344,44 +401,7 @@ function generarResumenCompleto(transcripcion: string): ResumenAlmacenado {
       generarResumenDesdeTranscripcion(textoParaGlobal) || textoParaGlobal.slice(0, 500)
   }
 
-  return { global, porAudio }
-}
-
-function leerResumenAlmacenado(raw: string | null | undefined): ResumenAlmacenado {
-  const t = String(raw ?? '').trim()
-  if (!t) return { global: '', porAudio: {} }
-  if (t.startsWith('{')) {
-    try {
-      const p = JSON.parse(t) as ResumenAlmacenado
-      return {
-        global: String(p.global ?? '').trim(),
-        porAudio:
-          p.porAudio && typeof p.porAudio === 'object' ? p.porAudio : {},
-      }
-    } catch {
-      return { global: t, porAudio: {} }
-    }
-  }
-  return {
-    global: t.replace(/========== Audio:\s*.+?\s*==========\s*/g, '').trim(),
-    porAudio: {},
-  }
-}
-
-function formatearResumenParaDescarga(data: ResumenAlmacenado): string {
-  const partes: string[] = []
-  for (const nombre of Object.keys(data.porAudio)) {
-    const texto = data.porAudio[nombre]?.trim()
-    if (texto) {
-      partes.push(`========== ${nombre} ==========\n\n${texto}`)
-    }
-  }
-  if (data.global.trim() && Object.keys(data.porAudio).length > 1) {
-    partes.push(`========== Resumen de la reunión ==========\n\n${data.global.trim()}`)
-  } else if (data.global.trim() && partes.length === 0) {
-    partes.push(data.global.trim())
-  }
-  return partes.join('\n\n')
+  return { global, temas: [], porAudio }
 }
 
 function nombreVisibleArchivo(storageKey: string): string {
@@ -580,7 +600,9 @@ const pool = mysql.createPool({
   password: process.env.DB_PASSWORD ?? '',
   database: process.env.DB_NAME ?? 'actalia_reuniones',
   waitForConnections: true,
-  connectionLimit: 10,
+  connectionLimit: 20,
+  queueLimit: 0,
+  connectTimeout: 10_000,
 })
 
 function isUnknownColumnError(err: unknown, column: string): boolean {
@@ -621,14 +643,35 @@ async function ensureActaOpcionesColumn(): Promise<void> {
   `)
   console.log('[db] columnas incluir_transcripcion_acta e incluir_resumen_acta creadas')
 }
+async function ensureTranscripcionDiarizacionColumn(): Promise<void> {
+  try {
+    await pool.query(
+      'SELECT transcripcion_json, transcripcion_aviso FROM reuniones LIMIT 0',
+    )
+    return
+  } catch (err) {
+    if (!isUnknownColumnError(err, 'transcripcion_json')) throw err
+  }
+  await pool.query(`
+    ALTER TABLE reuniones
+      ADD COLUMN transcripcion_json LONGTEXT NULL,
+      ADD COLUMN transcripcion_aviso VARCHAR(600) NULL
+  `)
+  console.log('[db] columnas transcripcion_json y transcripcion_aviso creadas')
+}
 
 function isCorsOriginAllowed(origin: string | undefined): boolean {
   if (!origin) return true
-  const configured = process.env.CORS_ORIGIN ?? 'http://localhost:5173'
+  const configured =
+    process.env.CORS_ORIGIN ??
+    'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:5175,http://127.0.0.1:5175'
   const allowed = configured.split(',').map((s) => s.trim()).filter(Boolean)
   if (allowed.includes(origin)) return true
-  // Vite puede usar 5174, 5175… si el puerto por defecto está ocupado
-  if (process.env.NODE_ENV !== 'production' && /^http:\/\/localhost:517\d+$/.test(origin)) {
+  // Desarrollo: cualquier puerto de Vite en localhost (5173, 5174, 5175…)
+  if (
+    process.env.NODE_ENV !== 'production' &&
+    /^https?:\/\/(localhost|127\.0\.0\.1):\d+$/.test(origin)
+  ) {
     return true
   }
   return false
@@ -639,8 +682,9 @@ app.use(
   cors({
     origin(origin, callback) {
       if (isCorsOriginAllowed(origin)) {
-        callback(null, true)
+        callback(null, origin ?? true)
       } else {
+        console.warn(`[cors] origen rechazado: ${origin ?? '(vacío)'}`)
         callback(new Error('Not allowed by CORS'))
       }
     },
@@ -649,6 +693,18 @@ app.use(
   }),
 )
 app.use(express.json())
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  const inicio = Date.now()
+  const cl = req.headers['content-length'] ?? '-'
+  console.log(`[http] --> ${req.method} ${req.originalUrl} content-length=${cl}`)
+  res.on('finish', () => {
+    console.log(
+      `[http] <-- ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - inicio}ms`,
+    )
+  })
+  next()
+})
 
 app.get('/', (_req: Request, res: Response) => {
   res.type('html').send(`<!DOCTYPE html>
@@ -689,7 +745,38 @@ const storage = multer.diskStorage({
   },
 })
 
-const upload = multer({ storage })
+const UPLOAD_MAX_BYTES = 100 * 1024 * 1024
+const upload = multer({
+  storage,
+  limits: { fileSize: UPLOAD_MAX_BYTES },
+})
+
+/** Logs por paso: si se congela, la última línea indica dónde. */
+function multerSingle(campo: string, ruta: string) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const reunionId = req.params.id
+    const cl = req.headers['content-length'] ?? '?'
+    console.log(
+      `[upload] 1/5 ${ruta} reunion=${reunionId} — esperando multipart (${cl} bytes máx ${UPLOAD_MAX_BYTES})`,
+    )
+    upload.single(campo)(req, res, (err: unknown) => {
+      if (err) {
+        console.error(`[upload] multer ERROR reunion=${reunionId}:`, err)
+        const msg = err instanceof Error ? err.message : String(err)
+        res.status(400).json({ error: msg })
+        return
+      }
+      if (req.file) {
+        console.log(
+          `[upload] 2/5 multer OK reunion=${reunionId} → ${req.file.filename} (${req.file.size} bytes, ${req.file.mimetype})`,
+        )
+      } else {
+        console.warn(`[upload] 2/5 multer sin archivo en campo "${campo}" reunion=${reunionId}`)
+      }
+      next()
+    })
+  }
+}
 
 app.get('/health', async (_req: Request, res: Response) => {
   try {
@@ -1010,12 +1097,15 @@ async function handleSubirArchivoReunion(req: Request, res: Response) {
     res.status(400).json({ error: 'id inválido' })
     return
   }
+  console.log(`[upload] 3/5 handler inicio reunion=${id}`)
   try {
+    console.log(`[upload] 4/5 consultando reunión en BD reunion=${id}`)
     const [existing] = await pool.query<RowDataPacket[]>(
       'SELECT id, estado FROM reuniones WHERE id = ? LIMIT 1',
       [id],
     )
     if (!existing[0]) {
+      console.warn(`[upload] reunión no encontrada id=${id}`)
       res.status(404).json({ error: 'reunión no encontrada' })
       return
     }
@@ -1027,7 +1117,13 @@ async function handleSubirArchivoReunion(req: Request, res: Response) {
     const mime = req.file.mimetype
     const tamanoBytes = req.file.size
     const tipo = clasificarTipoArchivo(mime, req.file.originalname)
+    const diskPath = path.join(uploadsDir, storageKey)
+    const enDisco = fs.existsSync(diskPath)
+    console.log(
+      `[upload] 4/5 archivo en disco=${enDisco} tipo=${tipo} path=${diskPath}`,
+    )
 
+    console.log(`[upload] 5/5 INSERT archivos_reunion reunion=${id}`)
     const insertSql =
       tipo === 'imagen'
         ? `INSERT INTO archivos_reunion (reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos, incluir_imagen_acta)
@@ -1060,6 +1156,9 @@ async function handleSubirArchivoReunion(req: Request, res: Response) {
     )
     const estado = String(reunionRows[0]?.estado ?? existing[0].estado ?? 'borrador')
 
+    console.log(
+      `[upload] 5/5 OK reunion=${id} archivo_id=${insertFile.insertId} estado=${estado}`,
+    )
     res.status(201).json({
       reunion_id: id,
       archivo_id: insertFile.insertId,
@@ -1072,12 +1171,21 @@ async function handleSubirArchivoReunion(req: Request, res: Response) {
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
+    console.error(`[upload] ERROR reunion=${id}:`, message)
     res.status(500).json({ error: message })
   }
 }
 
-app.post('/api/reuniones/:id/audio', upload.single('file'), handleSubirArchivoReunion)
-app.post('/api/reuniones/:id/archivo', upload.single('file'), handleSubirArchivoReunion)
+app.post(
+  '/api/reuniones/:id/audio',
+  multerSingle('file', 'POST /audio'),
+  handleSubirArchivoReunion,
+)
+app.post(
+  '/api/reuniones/:id/archivo',
+  multerSingle('file', 'POST /archivo'),
+  handleSubirArchivoReunion,
+)
 app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) => {
   const id = parseId(req.params.id)
   if (id === null) {
@@ -1085,7 +1193,10 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
     return
   }
 
+  console.log(`[transcribir] 1/6 inicio reunion=${id} body=${JSON.stringify(req.body ?? {})}`)
+
   try {
+    console.log(`[transcribir] 2/6 comprobando reunión en BD reunion=${id}`)
     const [reunionRows] = await pool.query<RowDataPacket[]>(
       'SELECT id FROM reuniones WHERE id = ? LIMIT 1',
       [id],
@@ -1155,6 +1266,10 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
       storageKeys = [storageKey]
     }
 
+    console.log(
+      `[transcribir] 3/6 archivos a procesar (${storageKeys.length}): ${storageKeys.join(', ')}`,
+    )
+
     await pool.query(
       `UPDATE reuniones SET estado = ?, error_mensaje = NULL, actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
       ['transcribiendo', id],
@@ -1162,21 +1277,129 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
 
     let transcripcion = ''
     const partes: string[] = []
+    const avisos: string[] = []
+    const jsonAlmacenado: TranscripcionJsonAlmacenada = {
+      diarizada: false,
+      segmentos: [],
+    }
+
     for (const storageKey of storageKeys) {
-      const texto = await transcribirStorageKey(storageKey)
+      console.log(`[transcribir] 4/6 transcribiendo storageKey=${storageKey}`)
+      const resultado = await transcribirStorageKey(storageKey)
+      console.log(`[transcribir] 5/6 terminó storageKey=${storageKey} chars=${resultado.texto.length}`)
+      if (resultado.aviso) avisos.push(resultado.aviso)
+      if (resultado.diarizada && resultado.segmentos.length > 0) {
+        jsonAlmacenado.diarizada = true
+        jsonAlmacenado.segmentos.push(...resultado.segmentos)
+      }
+      const bloqueTexto = resultado.texto
       if (storageKeys.length > 1) {
-        partes.push(`${encabezadoTranscripcionArchivo(storageKey)}\n\n${texto}`)
+        partes.push(`${encabezadoTranscripcionArchivo(storageKey)}\n\n${bloqueTexto}`)
       } else {
-        transcripcion = texto
+        transcripcion = bloqueTexto
       }
     }
     if (partes.length > 0) {
       transcripcion = partes.join('\n\n').trim()
     }
 
+    const transcripcionAviso =
+      [...new Set(avisos.map((a) => a.trim()).filter(Boolean))].join(' ') || null
+    const transcripcionJson =
+      jsonAlmacenado.segmentos.length > 0 || jsonAlmacenado.diarizada
+        ? JSON.stringify(jsonAlmacenado)
+        : null
+
+    console.log(`[transcribir] 6/6 guardando en BD reunion=${id}`)
     await pool.query(
-      `UPDATE reuniones SET estado = ?, transcripcion = ?, error_mensaje = NULL, actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
-      ['transcrito', transcripcion, id],
+      `UPDATE reuniones SET estado = ?, transcripcion = ?, transcripcion_json = ?, transcripcion_aviso = ?, error_mensaje = NULL, actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
+      ['transcrito', transcripcion, transcripcionJson, transcripcionAviso, id],
+    )
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT * FROM reuniones WHERE id = ? LIMIT 1',
+      [id],
+    )
+    const [archivos] = await pool.query<RowDataPacket[]>(
+      `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
+      [id],
+    )
+    const row = rows[0]
+    if (!row) {
+      res.status(500).json({ error: 'no se pudo leer la reunión actualizada' })
+      return
+    }
+
+    console.log(`[transcribir] 6/6 OK reunion=${id}`)
+    res.json({
+      ...row,
+      estado_etiqueta: etiquetaEstado(String(row.estado)),
+      archivos,
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.error(`[transcribir] ERROR reunion=${id}:`, message)
+    try {
+      await pool.query(
+        `UPDATE reuniones SET estado = ?, error_mensaje = ?, actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
+        ['error', message.slice(0, 2000), id],
+      )
+    } catch {
+      /* ignorar error al guardar estado error */
+    }
+    res.status(500).json({ error: message })
+  }
+})
+
+app.patch('/api/reuniones/:id/hablantes', async (req: Request, res: Response) => {
+  const id = parseId(req.params.id)
+  if (id === null) {
+    res.status(400).json({ error: 'id inválido' })
+    return
+  }
+
+  const hablantesEntrada = normalizarMapaHablantes(req.body?.hablantes)
+
+  try {
+    const [reunionRows] = await pool.query<RowDataPacket[]>(
+      'SELECT id, transcripcion_json FROM reuniones WHERE id = ? LIMIT 1',
+      [id],
+    )
+    const reunion = reunionRows[0]
+    if (!reunion) {
+      res.status(404).json({ error: 'reunión no encontrada' })
+      return
+    }
+
+    const json = parseTranscripcionJsonAlmacenado(
+      String(reunion.transcripcion_json ?? ''),
+    )
+    if (!json?.diarizada || json.segmentos.length === 0) {
+      res.status(400).json({
+        error: 'esta reunión no tiene transcripción diarizada con segmentos',
+      })
+      return
+    }
+
+    const speakers = new Set(
+      json.segmentos.map((s) => s.speaker.trim() || '?'),
+    )
+    const hablantes: Record<string, string> = {}
+    for (const [key, nombre] of Object.entries(hablantesEntrada)) {
+      if (speakers.has(key)) hablantes[key] = nombre
+    }
+
+    const jsonActualizado: TranscripcionJsonAlmacenada = {
+      diarizada: json.diarizada,
+      segmentos: json.segmentos,
+      ...(Object.keys(hablantes).length > 0 ? { hablantes } : {}),
+    }
+    const transcripcion = segmentosATextoPlano(json.segmentos, hablantes)
+    const transcripcionJson = JSON.stringify(jsonActualizado)
+
+    await pool.query(
+      `UPDATE reuniones SET transcripcion = ?, transcripcion_json = ?, actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
+      [transcripcion, transcripcionJson, id],
     )
 
     const [rows] = await pool.query<RowDataPacket[]>(
@@ -1200,14 +1423,6 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    try {
-      await pool.query(
-        `UPDATE reuniones SET estado = ?, error_mensaje = ?, actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
-        ['error', message.slice(0, 2000), id],
-      )
-    } catch {
-      /* ignorar error al guardar estado error */
-    }
     res.status(500).json({ error: message })
   }
 })
@@ -1245,7 +1460,11 @@ app.post('/api/reuniones/:id/resumir', async (req: Request, res: Response) => {
       transcripcion,
       String(reunion.titulo ?? ''),
     )
-    if (!resumenData.global && Object.keys(resumenData.porAudio).length === 0) {
+    if (
+      !resumenData.global &&
+      resumenData.temas.length === 0 &&
+      Object.keys(resumenData.porAudio).length === 0
+    ) {
       throw new Error('no se pudo generar el resumen')
     }
 
@@ -1718,10 +1937,17 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: message })
 })
 
-void Promise.all([ensureIncluirImagenActaColumn(), ensureActaOpcionesColumn()])
+void Promise.all([
+  ensureIncluirImagenActaColumn(),
+  ensureActaOpcionesColumn(),
+  ensureTranscripcionDiarizacionColumn(),
+])
   .then(() => {
-    app.listen(PORT, () => {
-      console.log(`API http://localhost:${PORT}`)
+    app.listen(PORT, '0.0.0.0', () => {
+      console.log(`API http://127.0.0.1:${PORT} (también http://localhost:${PORT})`)
+      console.log(`[upload] carpeta uploads: ${uploadsDir}`)
+      console.log('[http] logs activos: cada petición muestra --> al entrar y <-- al responder')
+      console.log(`[cors] orígenes permitidos (dev): localhost/127.0.0.1 puertos 5173-5179 + ${process.env.CORS_ORIGIN ?? 'por defecto'}`)
     })
   })
   .catch((err) => {
