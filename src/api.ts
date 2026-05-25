@@ -167,6 +167,17 @@ export async function extraerTextoImagen(
   return parseJson<Reunion>(res)
 }
 
+export async function interpretarImagen(
+  reunionId: number,
+  archivoId: number,
+): Promise<Reunion> {
+  const res = await fetch(
+    apiUrl(`/api/reuniones/${reunionId}/archivos/${archivoId}/interpretar`),
+    { method: 'POST' },
+  )
+  return parseJson<Reunion>(res)
+}
+
 export async function setIncluirImagenActa(
   reunionId: number,
   archivoId: number,
@@ -230,8 +241,8 @@ export function transcripcionPdfUrl(reunionId: number): string {
 export function actaPdfUrl(reunionId: number): string {
   return apiUrl(`/api/reuniones/${reunionId}/acta.pdf`)
 }
-export function resumenTxtUrl(reunionId: number): string {
-  return apiUrl(`/api/reuniones/${reunionId}/resumen.txt`)
+export function resumenPdfUrl(reunionId: number): string {
+  return apiUrl(`/api/reuniones/${reunionId}/resumen.pdf`)
 }
 
 /** Texto para la UI (pill de conexión, mensajes de error). */

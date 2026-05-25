@@ -10,7 +10,6 @@ import multer from 'multer'
 import mysql from 'mysql2/promise'
 import type { ResultSetHeader, RowDataPacket } from 'mysql2'
 import PDFDocument from 'pdfkit'
-import sharp from 'sharp'
 import { etiquetaEstado } from './estados'
 import {
   transcribirStorageKey as transcribirArchivoLocal,
@@ -30,8 +29,11 @@ import {
   leerResumenAlmacenado,
   type ResumenAlmacenado,
 } from './resumen'
+import { escribirPdfActa } from './pdfActa'
 import {
   OPENAI_MAX_AUDIO_BYTES,
+  interpretarImagenOpenAi,
+  openAiConfigured,
   resumirTranscripcionOpenAi,
   useOpenAiSummary,
   useOpenAiTranscription,
@@ -409,189 +411,8 @@ function nombreVisibleArchivo(storageKey: string): string {
   return sinPrefijo || storageKey
 }
 
-function etiquetaTipoArchivoActa(tipo: string): string {
-  if (tipo === 'imagen') return 'Imagen'
-  if (tipo === 'documento') return 'Documento'
-  if (tipo === 'audio') return 'Audio'
-  if (tipo === 'video') return 'Vídeo'
-  return tipo
-}
-
 const ARCHIVOS_LIST_SELECT = `SELECT id, reunion_id, tipo, storage_key, mime, tamano_bytes, duracion_segundos, creado_en, texto_ocr, incluir_imagen_acta
        FROM archivos_reunion`
-
-function incluirImagenActaActivo(archivo: RowDataPacket): boolean {
-  const v = archivo.incluir_imagen_acta
-  if (v === null || v === undefined) return true
-  return v !== 0 && v !== false && v !== '0'
-}
-function incluirTranscripcionActaActivo(reunion: RowDataPacket): boolean {
-  return Number(reunion.incluir_transcripcion_acta) === 1
-}
-
-function incluirResumenActaActivo(reunion: RowDataPacket): boolean {
-  return Number(reunion.incluir_resumen_acta) === 1
-}
-/** Imagen en PDF solo si el usuario la marcó (incluir_imagen_acta). */
-function debeIncrustarImagenEnActa(archivo: RowDataPacket): boolean {
-  if (String(archivo.tipo ?? '') !== 'imagen') return false
-  const storageKey = String(archivo.storage_key ?? '')
-  if (!storageKey || storageKey.includes('..') || /[/\\]/.test(storageKey)) return false
-  return incluirImagenActaActivo(archivo)
-}
-
-const ACTA_IMAGEN_FIT: [number, number] = [450, 280]
-const ACTA_IMAGEN_ALTO_APROX = ACTA_IMAGEN_FIT[1] + 24
-
-const PDFKIT_IMAGEN_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif'])
-
-async function prepararImagenParaPdf(filePath: string): Promise<string | Buffer | null> {
-  const ext = path.extname(filePath).toLowerCase()
-  if (PDFKIT_IMAGEN_EXT.has(ext)) return filePath
-  try {
-    return await sharp(filePath).png().toBuffer()
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error(`[acta.pdf] conversión sharp ${filePath}:`, msg)
-    return null
-  }
-}
-
-function asegurarEspacioImagenEnPagina(doc: InstanceType<typeof PDFDocument>): void {
-  const margenInf = doc.page.margins.bottom ?? 50
-  const limiteY = doc.page.height - margenInf
-  if (doc.y + ACTA_IMAGEN_ALTO_APROX > limiteY) {
-    doc.addPage()
-  }
-}
-
-async function incrustarImagenEnActaPdf(
-  doc: InstanceType<typeof PDFDocument>,
-  archivo: RowDataPacket,
-  uploadsDirPath: string,
-): Promise<void> {
-  if (!debeIncrustarImagenEnActa(archivo)) return
-  const storageKey = String(archivo.storage_key ?? '')
-  const filePath = path.join(uploadsDirPath, storageKey)
-  if (!fs.existsSync(filePath)) return
-
-  const imageSource = await prepararImagenParaPdf(filePath)
-  if (!imageSource) {
-    doc
-      .fontSize(9)
-      .fillColor('#666666')
-      .text(
-        `(No se pudo preparar la imagen ${path.extname(filePath)} para el PDF.)`,
-      )
-    doc.moveDown(0.5)
-    doc.fillColor('#000000')
-    return
-  }
-
-  asegurarEspacioImagenEnPagina(doc)
-
-  try {
-    doc.image(imageSource, { fit: ACTA_IMAGEN_FIT })
-    doc.moveDown(0.5)
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
-    console.error(`[acta.pdf] no se pudo incrustar ${storageKey}:`, msg)
-    doc.fontSize(9).fillColor('#666666').text('(No se pudo incrustar esta imagen en el PDF.)')
-    doc.moveDown(0.5)
-    doc.fillColor('#000000')
-  }
-}
-
-async function escribirPdfActa(
-  doc: InstanceType<typeof PDFDocument>,
-  reunion: RowDataPacket,
-  archivos: RowDataPacket[],
-  uploadsDirPath: string,
-): Promise<void> {
-  const titulo = String(reunion.titulo ?? 'Reunión')
-  const fecha = reunion.creado_en
-    ? new Date(String(reunion.creado_en)).toLocaleString('es-ES')
-    : ''
-
-  const transcripcion = String(reunion.transcripcion ?? '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .trim()
-
-  doc.fontSize(18).fillColor('#000000').text('Acta de reunión', { align: 'center' })
-  doc.moveDown(0.5)
-  doc.fontSize(16).text(titulo, { underline: true })
-  doc.moveDown(0.5)
-  if (fecha) {
-    doc.fontSize(10).fillColor('#444444').text(fecha)
-  }
-  doc.moveDown()
-
-  if (incluirResumenActaActivo(reunion)) {
-    const resumenRaw = String(reunion.resumen ?? '').trim()
-    if (resumenRaw) {
-      const textoResumen = formatearResumenParaDescarga(
-        leerResumenAlmacenado(resumenRaw),
-      )
-      if (textoResumen) {
-        doc.fontSize(12).text('Resumen', { underline: true })
-        doc.moveDown(0.5)
-        doc.fontSize(11).text(textoResumen, { align: 'left', lineGap: 4 })
-        doc.moveDown()
-      }
-    }
-  }
-
-  if (incluirTranscripcionActaActivo(reunion) && transcripcion) {
-    doc.fontSize(12).text('Transcripción', { underline: true })
-    doc.moveDown(0.5)
-    doc.fontSize(11).text(transcripcion, { align: 'left', lineGap: 4 })
-    doc.moveDown()
-  }
- 
-
-  const conTexto = archivos.filter((a) => String(a.texto_ocr ?? '').trim())
-  if (conTexto.length > 0) {
-    doc.fontSize(12).text('Textos extraídos de adjuntos', { underline: true })
-    doc.moveDown(0.5)
-    doc.fontSize(11)
-    for (const archivo of conTexto) {
-      const storageKey = String(archivo.storage_key ?? '')
-      const nombre = nombreVisibleArchivo(storageKey)
-      const tipo = String(archivo.tipo ?? '')
-      const texto = String(archivo.texto_ocr ?? '').trim()
-      doc.fillColor('#000000').text(`${nombre} (${etiquetaTipoArchivoActa(tipo)})`)
-      doc.moveDown(0.25)
-      await incrustarImagenEnActaPdf(doc, archivo, uploadsDirPath)
-      doc.text(texto, { align: 'left', lineGap: 3 })
-      doc.moveDown()
-    }
-  }
-
-  const otros = archivos.filter((a) => {
-    if (String(a.texto_ocr ?? '').trim()) return false
-    if (String(a.tipo ?? '') === 'imagen' && !incluirImagenActaActivo(a)) return false
-    return true
-  })
-  if (otros.length > 0) {
-    doc.fontSize(12).text('Otros adjuntos (sin texto extraído)', { underline: true })
-    doc.moveDown(0.5)
-    doc.fontSize(10).fillColor('#444444')
-    for (const archivo of otros) {
-      const storageKey = String(archivo.storage_key ?? '')
-      const nombre = nombreVisibleArchivo(storageKey)
-      const tipoRaw = String(archivo.tipo ?? '')
-      const tipo = etiquetaTipoArchivoActa(tipoRaw)
-      doc.text(`• ${nombre} (${tipo})`)
-      if (tipoRaw === 'imagen') {
-        doc.moveDown(0.25)
-        await incrustarImagenEnActaPdf(doc, archivo, uploadsDirPath)
-      }
-    }
-    doc.fillColor('#000000')
-  }
-}
-
 
 const pool = mysql.createPool({
   host: process.env.DB_HOST ?? '127.0.0.1',
@@ -961,7 +782,7 @@ app.get('/api/reuniones/:id/transcripcion.pdf', async (req: Request, res: Respon
   }
 })
 
-app.get('/api/reuniones/:id/resumen.txt', async (req: Request, res: Response) => {
+app.get('/api/reuniones/:id/resumen.pdf', async (req: Request, res: Response) => {
   const id = parseId(req.params.id)
   if (id === null) {
     res.status(400).json({ error: 'id inválido' })
@@ -970,7 +791,7 @@ app.get('/api/reuniones/:id/resumen.txt', async (req: Request, res: Response) =>
 
   try {
     const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT titulo, resumen FROM reuniones WHERE id = ? LIMIT 1',
+      'SELECT titulo, resumen, creado_en FROM reuniones WHERE id = ? LIMIT 1',
       [id],
     )
     const row = rows[0]
@@ -985,15 +806,34 @@ app.get('/api/reuniones/:id/resumen.txt', async (req: Request, res: Response) =>
       return
     }
 
-    const titulo = String(row.titulo ?? 'reunion')
-    const filename = `resumen_${nombreArchivoDescarga(titulo, id, 'txt')}`
+    const titulo = String(row.titulo ?? 'Reunión')
+    const filename = `resumen_${nombreArchivoDescarga(titulo, id, 'pdf')}`
+    const fecha = row.creado_en
+      ? new Date(String(row.creado_en)).toLocaleString('es-ES')
+      : ''
 
-    res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+    res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
-    res.send(cuerpo)
+
+    const doc = new PDFDocument({ margin: 50 })
+    doc.pipe(res)
+
+    doc.fontSize(16).text(titulo, { underline: true })
+    doc.moveDown(0.5)
+    if (fecha) {
+      doc.fontSize(10).fillColor('#444444').text(fecha)
+    }
+    doc.moveDown()
+    doc.fontSize(11).fillColor('#000000').text('Resumen', { underline: true })
+    doc.moveDown(0.5)
+    doc.text(cuerpo, { align: 'left', lineGap: 4 })
+
+    doc.end()
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
-    res.status(500).json({ error: message })
+    if (!res.headersSent) {
+      res.status(500).json({ error: message })
+    }
   }
 })
 
@@ -1006,7 +846,7 @@ app.get('/api/reuniones/:id/acta.pdf', async (req: Request, res: Response) => {
 
   try {
     const [reunionRows] = await pool.query<RowDataPacket[]>(
-      'SELECT titulo, resumen, transcripcion, creado_en, incluir_transcripcion_acta, incluir_resumen_acta FROM reuniones WHERE id = ? LIMIT 1',
+      'SELECT id, titulo, resumen, transcripcion, transcripcion_json, creado_en, incluir_transcripcion_acta, incluir_resumen_acta FROM reuniones WHERE id = ? LIMIT 1',
       [id],
     )
     const reunion = reunionRows[0]
@@ -1016,7 +856,7 @@ app.get('/api/reuniones/:id/acta.pdf', async (req: Request, res: Response) => {
     }
 
     const [archivos] = await pool.query<RowDataPacket[]>(
-      `SELECT id, tipo, storage_key, texto_ocr, incluir_imagen_acta FROM archivos_reunion
+      `SELECT id, tipo, storage_key, duracion_segundos, texto_ocr, incluir_imagen_acta FROM archivos_reunion
        WHERE reunion_id = ? ORDER BY creado_en ASC`,
       [id],
     )
@@ -1036,7 +876,7 @@ app.get('/api/reuniones/:id/acta.pdf', async (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'application/pdf')
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`)
 
-    const doc = new PDFDocument({ margin: 50 })
+    const doc = new PDFDocument({ margin: 72, size: 'A4', bufferPages: true })
     doc.pipe(res)
     await escribirPdfActa(doc, reunion, archivos, uploadsDir)
     doc.end()
@@ -1601,6 +1441,84 @@ app.post(
       await pool.query(
         `UPDATE archivos_reunion SET texto_ocr = ?, incluir_imagen_acta = 1 WHERE id = ? AND reunion_id = ?`,
         [textoOcr, archivoId, reunionId],
+      )
+
+      const [reunionRows] = await pool.query<RowDataPacket[]>(
+        'SELECT * FROM reuniones WHERE id = ? LIMIT 1',
+        [reunionId],
+      )
+      const [archivos] = await pool.query<RowDataPacket[]>(
+        `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
+        [reunionId],
+      )
+      const reunion = reunionRows[0]
+      if (!reunion) {
+        res.status(404).json({ error: 'reunión no encontrada' })
+        return
+      }
+
+      res.json({
+        ...reunion,
+        estado_etiqueta: etiquetaEstado(String(reunion.estado)),
+        archivos,
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      res.status(500).json({ error: message })
+    }
+  },
+)
+
+app.post(
+  '/api/reuniones/:reunionId/archivos/:archivoId/interpretar',
+  async (req: Request, res: Response) => {
+    const reunionId = parseId(req.params.reunionId)
+    const archivoId = parseId(req.params.archivoId)
+    if (reunionId === null || archivoId === null) {
+      res.status(400).json({ error: 'id inválido' })
+      return
+    }
+
+    if (!openAiConfigured()) {
+      res.status(503).json({ error: 'OPENAI_API_KEY no configurada en server/.env' })
+      return
+    }
+
+    try {
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT storage_key, tipo FROM archivos_reunion
+         WHERE id = ? AND reunion_id = ?
+         LIMIT 1`,
+        [archivoId, reunionId],
+      )
+      const row = rows[0]
+      if (!row) {
+        res.status(404).json({ error: 'archivo no encontrado' })
+        return
+      }
+      if (String(row.tipo) !== 'imagen') {
+        res.status(400).json({ error: 'la interpretación solo está disponible para imágenes' })
+        return
+      }
+
+      const storageKey = String(row.storage_key ?? '')
+      if (!storageKey || storageKey.includes('..') || /[/\\]/.test(storageKey)) {
+        res.status(404).json({ error: 'archivo inválido' })
+        return
+      }
+
+      const filePath = path.join(uploadsDir, storageKey)
+      if (!fs.existsSync(filePath)) {
+        res.status(404).json({ error: 'archivo no encontrado en disco' })
+        return
+      }
+
+      console.log(`[vision] interpretando imagen reunión=${reunionId} archivo=${archivoId}`)
+      const descripcion = await interpretarImagenOpenAi(path.resolve(filePath))
+
+      await pool.query(
+        `UPDATE archivos_reunion SET texto_ocr = ?, incluir_imagen_acta = 1 WHERE id = ? AND reunion_id = ?`,
+        [descripcion, archivoId, reunionId],
       )
 
       const [reunionRows] = await pool.query<RowDataPacket[]>(

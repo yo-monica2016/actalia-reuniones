@@ -13,13 +13,13 @@ import {
   archivoUrl,
   downloadArchivo,
   extraerTextoImagen,
+  interpretarImagen,
   extraerTextoDocumento,
   setIncluirImagenActa,
   setActaOpciones,
-  transcripcionTxtUrl,
   transcripcionPdfUrl,
   actaPdfUrl,
-  resumenTxtUrl,
+  resumenPdfUrl,
   API_BASE_DISPLAY,
 } from './api'
 import { RenombrarHablantes } from './components/RenombrarHablantes'
@@ -96,6 +96,45 @@ function etiquetaTranscribiendo(
   return minutos > 0 ? `Transcribiendo… (${minutos} min)` : 'Transcribiendo…'
 }
 
+function estimarDuracionTranscripcionSeg(
+  archivos: ArchivoReunion[] | undefined,
+  opts?: { archivoId?: number; todos?: boolean },
+): { duracionSeg: number; numAudios: number } {
+  const audios = (archivos ?? []).filter(
+    (a) => a.tipo === 'audio' || a.tipo === 'video',
+  )
+  if (opts?.todos) {
+    const total = audios.reduce((s, a) => s + (a.duracion_segundos ?? 0), 0)
+    const n = Math.max(1, audios.length)
+    return {
+      duracionSeg: total > 0 ? total : 20 * 60 * n,
+      numAudios: n,
+    }
+  }
+  if (opts?.archivoId != null) {
+    const uno = audios.find((a) => a.id === opts.archivoId)
+    const seg = uno?.duracion_segundos ?? 0
+    return { duracionSeg: seg > 0 ? seg : 20 * 60, numAudios: 1 }
+  }
+  const reciente = [...audios].sort((a, b) =>
+    b.creado_en.localeCompare(a.creado_en),
+  )[0]
+  const seg = reciente?.duracion_segundos ?? 0
+  return { duracionSeg: seg > 0 ? seg : 20 * 60, numAudios: 1 }
+}
+
+function porcentajeTranscripcionEstimado(
+  inicioMs: number,
+  duracionSeg: number,
+  numAudios: number,
+): number {
+  const trozos = Math.max(1, Math.ceil(duracionSeg / 720))
+  const estimadoMs = 45_000 + numAudios * trozos * 4.5 * 60_000
+  const elapsed = Date.now() - inicioMs
+  const ratio = Math.min(1, elapsed / estimadoMs)
+  return Math.min(94, Math.max(5, Math.round(5 + ratio * 89)))
+}
+
 function formatFecha(iso: string): string {
   try {
     return new Date(iso).toLocaleString('es-ES', {
@@ -138,10 +177,16 @@ function App() {
   >({})
   const [transcripcionActiva, setTranscripcionActiva] = useState(false)
   const [transcripcionMinutos, setTranscripcionMinutos] = useState(0)
+  const [transcripcionPorcentaje, setTranscripcionPorcentaje] = useState(0)
+  const [vistaRevisionTranscripcion, setVistaRevisionTranscripcion] = useState<
+    'nombres' | 'conversacion'
+  >('nombres')
+  const [panelRevisionAbierto, setPanelRevisionAbierto] = useState(false)
   const [transcripcionNotaExtra, setTranscripcionNotaExtra] = useState<string | null>(
     null,
   )
   const transcripcionInicioRef = useRef<number | null>(null)
+  const transcripcionMetaRef = useRef({ duracionSeg: 20 * 60, numAudios: 1 })
   const chunksRef = useRef<Blob[]>([])
   const mediaRefs = useRef<Map<number, HTMLMediaElement>>(new Map())
   const cargarLista = useCallback(async () => {
@@ -175,6 +220,9 @@ function App() {
     mediaRefs.current.clear()
     setMostrarResumenes(false)
     setOcrVisiblePorArchivo({})
+    setTranscripcionPorcentaje(0)
+    setVistaRevisionTranscripcion('nombres')
+    setPanelRevisionAbierto(false)
   }, [selectedId])
 
   useEffect(() => {
@@ -183,6 +231,10 @@ function App() {
     const tick = () => {
       const inicio = transcripcionInicioRef.current
       if (inicio == null) return
+      const { duracionSeg, numAudios } = transcripcionMetaRef.current
+      setTranscripcionPorcentaje(
+        porcentajeTranscripcionEstimado(inicio, duracionSeg, numAudios),
+      )
       const min = Math.floor((Date.now() - inicio) / 60000)
       setTranscripcionMinutos(min)
       if (min === 5) {
@@ -196,7 +248,7 @@ function App() {
     }
 
     tick()
-    const id = window.setInterval(tick, 300000)
+    const id = window.setInterval(tick, 1000)
     return () => window.clearInterval(id)
   }, [transcripcionActiva])
 
@@ -264,10 +316,15 @@ function App() {
     }
   }
 
-  function iniciarAvisoTranscripcion() {
+  function iniciarAvisoTranscripcion(meta: {
+    duracionSeg: number
+    numAudios: number
+  }) {
+    transcripcionMetaRef.current = meta
     transcripcionInicioRef.current = Date.now()
     setTranscripcionMinutos(0)
     setTranscripcionNotaExtra(null)
+    setTranscripcionPorcentaje(5)
     setTranscripcionActiva(true)
   }
 
@@ -276,11 +333,16 @@ function App() {
     setTranscripcionActiva(false)
     setTranscripcionMinutos(0)
     setTranscripcionNotaExtra(null)
+    setTranscripcionPorcentaje(0)
   }
 
   async function handleTranscribir(archivoId?: number) {
     if (selectedId == null) return
-    iniciarAvisoTranscripcion()
+    iniciarAvisoTranscripcion(
+      estimarDuracionTranscripcionSeg(detalle?.archivos, {
+        archivoId: archivoId ?? undefined,
+      }),
+    )
     setLoading(true)
     setMensaje(null)
     try {
@@ -305,7 +367,9 @@ function App() {
 
   async function handleTranscribirTodos() {
     if (selectedId == null) return
-    iniciarAvisoTranscripcion()
+    iniciarAvisoTranscripcion(
+      estimarDuracionTranscripcionSeg(detalle?.archivos, { todos: true }),
+    )
     setLoading(true)
     setMensaje(null)
     try {
@@ -419,6 +483,26 @@ function App() {
       setMensaje({
         tipo: 'error',
         text: err instanceof Error ? err.message : 'Error al extraer texto',
+      })
+      await cargarDetalle(selectedId)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function handleInterpretarImagen(archivoId: number) {
+    if (selectedId == null) return
+    setLoading(true)
+    setMensaje(null)
+    try {
+      const actualizada = await interpretarImagen(selectedId, archivoId)
+      setDetalle(actualizada)
+      setOcrVisiblePorArchivo((prev) => ({ ...prev, [archivoId]: true }))
+      setMensaje({ tipo: 'ok', text: 'Imagen interpretada correctamente' })
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al interpretar la imagen',
       })
       await cargarDetalle(selectedId)
     } finally {
@@ -723,12 +807,27 @@ function App() {
                   {transcripcionNotaExtra && (
                     <p className="transcripcion-aviso-nota">{transcripcionNotaExtra}</p>
                   )}
-                  <div className="transcripcion-aviso-bar" aria-hidden="true" />
+                  <div
+                    className="transcripcion-progreso"
+                    role="progressbar"
+                    aria-valuenow={transcripcionPorcentaje}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-label="Progreso de la transcripción"
+                  >
+                    <div
+                      className="transcripcion-progreso-fill"
+                      style={{ width: `${transcripcionPorcentaje}%` }}
+                    />
+                  </div>
+                  <p className="transcripcion-progreso-porcentaje">
+                    {transcripcionPorcentaje}% — transcripción en curso
+                  </p>
                 </div>
               )}
 
               <dl className="meta-grid">
-               
+
                 <div>
                   <dt>Creada</dt>
                   <dd>{formatFecha(detalle.creado_en)}</dd>
@@ -834,6 +933,14 @@ function App() {
                               <button
                                 type="button"
                                 className="btn-secondary btn-archivo-accion"
+                                onClick={() => void handleInterpretarImagen(a.id)}
+                                disabled={loading || apiOk !== true}
+                              >
+                                {loading ? 'Interpretando…' : 'Interpretar imagen (IA)'}
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-secondary btn-archivo-accion"
                                 onClick={() => void handleExtraerTextoImagen(a.id)}
                                 disabled={loading || apiOk !== true}
                               >
@@ -868,12 +975,12 @@ function App() {
                                     }
                                   >
                                     {ocrVisiblePorArchivo[a.id]
-                                      ? 'Ocultar transcrito'
-                                      : 'Ver transcrito'}
+                                      ? 'Ocultar descripción'
+                                      : 'Ver descripción'}
                                   </button>
                                   {ocrVisiblePorArchivo[a.id] && (
                                     <div className="archivo-ocr-texto">
-                                      <h4>Texto de la imagen</h4>
+                                      <h4>Descripción de la imagen</h4>
                                       <p className="text-block">{a.texto_ocr}</p>
                                     </div>
                                   )}
@@ -885,7 +992,7 @@ function App() {
                             <>
                               <p className="muted archivo-doc-hint">
                                 PDF o PowerPoint (.pptx).
-                               
+
                               </p>
                               <button
                                 type="button"
@@ -988,10 +1095,10 @@ function App() {
                     <>
                       <a
                         className="btn-secondary descarga-link"
-                        href={resumenTxtUrl(detalle.id)}
+                        href={resumenPdfUrl(detalle.id)}
                         download
                       >
-                        Descargar resumen (.txt)
+                        Descargar resumen (PDF)
                       </a>
                       <button
                         type="button"
@@ -1046,42 +1153,11 @@ function App() {
               </section>
               <section className="upload-section">
                 <h3>Transcripción</h3>
-                <p className="muted">
-                  «Transcribir este» en cada archivo → solo ese audio.
-                  {audiosReunion.length > 1 && (
-                    <> «Transcribir todos» une todos en un solo texto.</>
-                  )}{' '}
-                  Con transcripción lista, descarga .txt o PDF.
-                </p>
-                {detalle.transcripcion_aviso?.trim() && (
-                  <p className="transcripcion-aviso-diarizacion" role="status">
-                    {detalle.transcripcion_aviso}
-                  </p>
-                )}
-                {parseTranscripcionJson(detalle.transcripcion_json)?.diarizada &&
-                  !detalle.transcripcion_aviso?.trim() && (
-                    <p className="transcripcion-ok-diarizacion" role="status">
-                      Voces separadas (Persona A, B…). Revisa por hablante abajo; el
-                      modelo puede agrupar o separar voces de forma automática.
-                    </p>
-                  )}
                 {(() => {
                   const json = parseTranscripcionJson(detalle.transcripcion_json)
-                  if (json?.diarizada && json.segmentos.length > 0) {
-                    return (
-                      <>
-                        <RenombrarHablantes
-                          reunionId={detalle.id}
-                          speakers={speakersUnicos(json.segmentos)}
-                          hablantesIniciales={json.hablantes}
-                          onGuardado={(r) => setDetalle(r)}
-                          disabled={loading}
-                        />
-                        <TranscripcionPorHablante json={json} />
-                      </>
-                    )
-                  }
-                  if (detalle.transcripcion?.trim()) {
+                  const diarizadaLista =
+                    json?.diarizada && (json.segmentos.length ?? 0) > 0
+                  if (!diarizadaLista && detalle.transcripcion?.trim()) {
                     return (
                       <pre className="transcripcion-preview">
                         {detalle.transcripcion}
@@ -1090,15 +1166,6 @@ function App() {
                   }
                   return null
                 })()}
-                {parseTranscripcionJson(detalle.transcripcion_json)?.diarizada &&
-                  detalle.transcripcion?.trim() && (
-                    <details className="transcripcion-plano-extra">
-                      <summary className="muted">Ver texto plano completo (todas las voces)</summary>
-                      <pre className="transcripcion-preview transcripcion-preview--completo">
-                        {detalle.transcripcion}
-                      </pre>
-                    </details>
-                  )}
                 <div className="descarga-transcripcion-botones">
                   {audiosReunion.length > 1 && (
                     <button
@@ -1142,73 +1209,129 @@ function App() {
                     )}
                   </button>
                   {detalle.transcripcion?.trim() && (
-                    <>
-                      <a
-                        className="btn-secondary descarga-link"
-                        href={transcripcionTxtUrl(detalle.id)}
-                        download
-                      >
-                        Descargar (.txt)
-                      </a>
-                      <a
-                        className="btn-secondary descarga-link"
-                        href={transcripcionPdfUrl(detalle.id)}
-                        download
-                      >
-                        Descargar PDF
-                      </a>
-                    </>
+                    <a
+                      className="btn-secondary descarga-link"
+                      href={transcripcionPdfUrl(detalle.id)}
+                      download
+                    >
+                      Descargar PDF
+                    </a>
                   )}
+                  {(() => {
+                    const json = parseTranscripcionJson(detalle.transcripcion_json)
+                    if (json?.diarizada && json.segmentos.length > 0) {
+                      return (
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => setPanelRevisionAbierto((v) => !v)}
+                          aria-expanded={panelRevisionAbierto}
+                        >
+                          {panelRevisionAbierto
+                            ? 'Ocultar revisión'
+                            : 'Revisar transcripción'}
+                        </button>
+                      )
+                    }
+                    return null
+                  })()}
                 </div>
+                {(() => {
+                  const json = parseTranscripcionJson(detalle.transcripcion_json)
+                  if (
+                    !panelRevisionAbierto ||
+                    !json?.diarizada ||
+                    json.segmentos.length === 0
+                  ) {
+                    return null
+                  }
+                  return (
+                    <div className="transcripcion-revision-panel">
+                      <div className="transcripcion-revision-contenido">
+                        <label className="transcripcion-revision-select-label">
+                          Qué quieres ver
+                          <select
+                            className="transcripcion-revision-select"
+                            value={vistaRevisionTranscripcion}
+                            onChange={(e) =>
+                              setVistaRevisionTranscripcion(
+                                e.target.value as 'nombres' | 'conversacion',
+                              )
+                            }
+                          >
+                            <option value="nombres">
+                              Nombres de personajes (guardar)
+                            </option>
+                            <option value="conversacion">
+                              Ver conversación por hablantes
+                            </option>
+                          </select>
+                        </label>
+                        {vistaRevisionTranscripcion === 'nombres' && (
+                          <RenombrarHablantes
+                            reunionId={detalle.id}
+                            speakers={speakersUnicos(json.segmentos)}
+                            hablantesIniciales={json.hablantes}
+                            onGuardado={(r) => setDetalle(r)}
+                            disabled={loading}
+                          />
+                        )}
+                        {vistaRevisionTranscripcion === 'conversacion' && (
+                          <TranscripcionPorHablante json={json} />
+                        )}
+                      </div>
+                    </div>
+                  )
+                })()}
               </section>
 
               {(detalle.resumen?.trim() ||
                 detalle.transcripcion?.trim() ||
                 detalle.archivos?.some((a) => a.texto_ocr?.trim()) ||
                 (detalle.archivos?.length ?? 0) > 0) && (
-                <section className="upload-section descarga-transcripcion">
-                  <h3>Acta de la reunión</h3>
-                  <p className="muted">
-                    Elige qué incluir en el PDF. Las fotos siguen con su
-                    checkbox en cada imagen.
-                  </p>
-                  <label className="archivo-acta-opcion">
-                    <input
-                      type="checkbox"
-                      checked={incluirTranscripcionActaMarcado(detalle)}
-                      disabled={
-                        loading || apiOk !== true || !detalle.transcripcion?.trim()
-                      }
-                      onChange={(e) =>
-                        void handleActaOpcion('transcripcion', e.target.checked)
-                      }
-                    />
-                    Incluir transcripción en el acta (PDF)
-                  </label>
-                  <label className="archivo-acta-opcion">
-                    <input
-                      type="checkbox"
-                      checked={incluirResumenActaMarcado(detalle)}
-                      disabled={loading || apiOk !== true || !detalle.resumen?.trim()}
-                      onChange={(e) =>
-                        void handleActaOpcion('resumen', e.target.checked)
-                      }
-                    />
-                    Incluir resumen en el acta (PDF)
-                  </label>
-                  <div className="descarga-transcripcion-botones">
-                    <a
-                      className="btn-secondary descarga-link"
-                      href={`${actaPdfUrl(detalle.id)}?v=${encodeURIComponent(detalle.actualizado_en)}`}
-                      download
-                    >
-                      Descargar acta (PDF)
-                    </a>
-                  </div>
+                  <section className="upload-section descarga-transcripcion">
+                    <h3>Acta de la reunión</h3>
+                    <p className="muted">
+                      Elige qué incluir en el PDF. Las fotos siguen con su
+                      checkbox en cada imagen.
+                    </p>
+                    <label className="archivo-acta-opcion">
+                      <input
+                        type="checkbox"
+                        checked={incluirTranscripcionActaMarcado(detalle)}
+                        disabled={
+                          loading || apiOk !== true || !detalle.transcripcion?.trim()
+                        }
+                        onChange={(e) =>
+                          void handleActaOpcion('transcripcion', e.target.checked)
+                        }
+                      />
+                      Incluir transcripción en el acta (PDF)
+                    </label>
+                    <label className="archivo-acta-opcion">
+                      <input
+                        type="checkbox"
+                        checked={incluirResumenActaMarcado(detalle)}
+                        disabled={loading || apiOk !== true || !detalle.resumen?.trim()}
+                        onChange={(e) =>
+                          void handleActaOpcion('resumen', e.target.checked)
+                        }
+                      />
+                      Incluir resumen en el acta (PDF)
+                    </label>
+                    <div className="descarga-transcripcion-botones">
+                      <a
+                        className="btn-secondary descarga-link"
+                        href={`${actaPdfUrl(detalle.id)}?v=${encodeURIComponent(detalle.actualizado_en)}`}
+                        download
+                      >
+                        Descargar acta (PDF)
+                      </a>
+                    </div>
 
 
-                </section>
-              )}
+                  </section>
+                )}
               {detalle.estado === 'borrador' && !detalle.archivos?.length && (
                 <p className="hint">Sube un audio para pasar al estado «Audio listo».</p>
               )}

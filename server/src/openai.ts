@@ -2,6 +2,7 @@ import './loadEnv'
 import fs from 'node:fs'
 import path from 'node:path'
 import OpenAI from 'openai'
+import sharp from 'sharp'
 
 export const OPENAI_MAX_AUDIO_BYTES = 25 * 1024 * 1024
 
@@ -243,7 +244,7 @@ export async function transcribirAudioOpenAiDiarize(
   const maxMbDiarize = (OPENAI_DIARIZE_MAX_BYTES / (1024 * 1024)).toFixed(1)
   console.log(
     `[openai] diarize inicio: ${path.basename(audioPath)} (${tamanoMb} MB), ` +
-      `timeout ${DIARIZE_TIMEOUT_MS}ms, ${DIARIZE_MAX_RETRIES} intento(s), máx diarize ${maxMbDiarize} MB`,
+    `timeout ${DIARIZE_TIMEOUT_MS}ms, ${DIARIZE_MAX_RETRIES} intento(s), máx diarize ${maxMbDiarize} MB`,
   )
 
   return conReintentosOpenAi(`diarize ${path.basename(audioPath)}`, () =>
@@ -352,4 +353,54 @@ export async function resumirTranscripcionOpenAi(
   }
 
   return { global, temas, porAudio }
+}
+export async function interpretarImagenOpenAi(filePath: string): Promise<string> {
+  if (!openAiConfigured()) {
+    throw new Error('OPENAI_API_KEY no configurada en server/.env')
+  }
+  const client = getClient()
+  const model = process.env.OPENAI_VISION_MODEL?.trim() || 'gpt-4o-mini'
+  const maxLado = Number(process.env.OPENAI_VISION_MAX_PX ?? 1280)
+
+  let buf = await sharp(filePath)
+    .rotate()
+    .resize(maxLado, maxLado, { fit: 'inside', withoutEnlargement: true })
+    .jpeg({ quality: 85 })
+    .toBuffer()
+  const mime = 'image/jpeg'
+  const base64 = buf.toString('base64')
+  buf = Buffer.alloc(0)
+
+  const completion = await conReintentosOpenAi(
+    `vision ${path.basename(filePath)}`,
+    () =>
+      client.chat.completions.create({
+        model,
+        temperature: 0.2,
+        max_tokens: 120,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text:
+                  'En español, describe la imagen en 1 o 2 frases cortas (máximo 40 palabras). ' +
+                  'Indica solo lo principal: quién o qué hay y qué hace. ' +
+                  'Si hay texto legible relevante, una frase aparte. ' +
+                  'Sin listas ni detalles secundarios. No inventes.',
+              },
+              {
+                type: 'image_url',
+                image_url: { url: `data:${mime};base64,${base64}` },
+              },
+            ],
+          },
+        ],
+      }),
+  )
+
+  const texto = completion.choices[0]?.message?.content?.trim() ?? ''
+  if (!texto) throw new Error('OpenAI no devolvió descripción de la imagen')
+  return texto
 }
