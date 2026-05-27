@@ -17,8 +17,9 @@ OPENAI_CHAT_MODEL=gpt-4o-mini
 
 **No uses** sintaxis tipo `VAR=valor` en PowerShell (eso es de bash/Linux). Toda la configuración va en `server/.env`.
 
-- Sin `OPENAI_API_KEY` o con `PROVIDER=local` → Whisper/Tesseract local (como antes).
-- Si OpenAI falla → el servidor usa **fallback local** automáticamente.
+- Transcripción: **solo OpenAI** (`TRANSCRIPTION_PROVIDER=openai` + `OPENAI_API_KEY`). No hay fallback a Whisper/Python local.
+- Resumen: OpenAI por defecto; si falla, puede usarse resumen local (`SUMMARY_PROVIDER=local` o reglas en `.env`).
+- OCR de imágenes: Tesseract en el servidor (opcional). Visión: OpenAI (`/interpretar`).
 
 ### Probar diarización
 
@@ -37,7 +38,7 @@ npm run test:diarize -- prueba-diarize-10min.mp3
 - Cada trozo se transcribe con **diarización** (Persona A/B) y se **une** en orden cronológico.
 - Los temporales en `server/uploads/tmp/` se **borran** al terminar.
 
-Requisito: **FFmpeg** en el PATH (o `FFMPEG_PATH` en `server/.env`).
+Requisito en el **servidor** (no en el PC del usuario): tras `npm install` en `server/` se incluye FFmpeg con `ffmpeg-static` y `ffprobe-static`. Opcional: `FFMPEG_PATH` / `FFPROBE_PATH` en `server/.env` para otro binario.
 
 Variables opcionales: `AUDIO_CHUNK_MIN_SEC`, `AUDIO_CHUNK_MAX_SEC`, `AUDIO_SILENCE_NOISE_DB`.
 

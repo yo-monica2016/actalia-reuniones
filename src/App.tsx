@@ -7,6 +7,7 @@ import {
   uploadAudio,
   uploadArchivo,
   transcribirReunion,
+  cancelarTranscripcion,
   resumirReunion,
   eliminarArchivo,
   eliminarReunion,
@@ -186,6 +187,7 @@ function App() {
     null,
   )
   const transcripcionInicioRef = useRef<number | null>(null)
+  const transcripcionAbortRef = useRef<AbortController | null>(null)
   const transcripcionMetaRef = useRef({ duracionSeg: 20 * 60, numAudios: 1 })
   const chunksRef = useRef<Blob[]>([])
   const mediaRefs = useRef<Map<number, HTMLMediaElement>>(new Map())
@@ -336,8 +338,36 @@ function App() {
     setTranscripcionPorcentaje(0)
   }
 
+  async function handlePararTranscripcion() {
+    if (selectedId == null) return
+    transcripcionAbortRef.current?.abort()
+    transcripcionAbortRef.current = null
+    setLoading(false)
+    finalizarAvisoTranscripcion()
+    try {
+      const actualizada = await cancelarTranscripcion(selectedId)
+      setDetalle(actualizada)
+      await cargarLista()
+      setMensaje({ tipo: 'ok', text: 'Transcripción detenida.' })
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text:
+          err instanceof Error ? err.message : 'No se pudo cancelar la transcripción',
+      })
+      void cargarDetalle(selectedId)
+    }
+  }
+
+  function esCancelacionTranscripcion(err: unknown): boolean {
+    return err instanceof Error && err.name === 'AbortError'
+  }
+
   async function handleTranscribir(archivoId?: number) {
     if (selectedId == null) return
+    transcripcionAbortRef.current?.abort()
+    const controller = new AbortController()
+    transcripcionAbortRef.current = controller
     iniciarAvisoTranscripcion(
       estimarDuracionTranscripcionSeg(detalle?.archivos, {
         archivoId: archivoId ?? undefined,
@@ -349,17 +379,20 @@ function App() {
       const actualizada = await transcribirReunion(
         selectedId,
         archivoId != null ? { archivoId } : {},
+        controller.signal,
       )
       setDetalle(actualizada)
       await cargarLista()
       setMensaje({ tipo: 'ok', text: mensajeTrasTranscripcion(actualizada) })
     } catch (err) {
+      if (esCancelacionTranscripcion(err)) return
       setMensaje({
         tipo: 'error',
         text: err instanceof Error ? err.message : 'Error al transcribir',
       })
       await cargarDetalle(selectedId)
     } finally {
+      transcripcionAbortRef.current = null
       setLoading(false)
       finalizarAvisoTranscripcion()
     }
@@ -367,13 +400,20 @@ function App() {
 
   async function handleTranscribirTodos() {
     if (selectedId == null) return
+    transcripcionAbortRef.current?.abort()
+    const controller = new AbortController()
+    transcripcionAbortRef.current = controller
     iniciarAvisoTranscripcion(
       estimarDuracionTranscripcionSeg(detalle?.archivos, { todos: true }),
     )
     setLoading(true)
     setMensaje(null)
     try {
-      const actualizada = await transcribirReunion(selectedId, { todos: true })
+      const actualizada = await transcribirReunion(
+        selectedId,
+        { todos: true },
+        controller.signal,
+      )
       setDetalle(actualizada)
       await cargarLista()
       setMensaje({
@@ -381,12 +421,14 @@ function App() {
         text: mensajeTrasTranscripcion(actualizada),
       })
     } catch (err) {
+      if (esCancelacionTranscripcion(err)) return
       setMensaje({
         tipo: 'error',
         text: err instanceof Error ? err.message : 'Error al transcribir',
       })
       await cargarDetalle(selectedId)
     } finally {
+      transcripcionAbortRef.current = null
       setLoading(false)
       finalizarAvisoTranscripcion()
     }
@@ -781,7 +823,7 @@ function App() {
                   type="button"
                   className="btn-secondary btn-eliminar-reunion"
                   onClick={() => void handleEliminarReunion()}
-                  disabled={loading || apiOk !== true}
+                  disabled={apiOk !== true || (loading && !transcripcionActiva)}
                 >
                   Eliminar reunión
                 </button>
@@ -823,6 +865,13 @@ function App() {
                   <p className="transcripcion-progreso-porcentaje">
                     {transcripcionPorcentaje}% — transcripción en curso
                   </p>
+                  <button
+                    type="button"
+                    className="btn-secondary transcripcion-parar-btn"
+                    onClick={handlePararTranscripcion}
+                  >
+                    Parar transcripción
+                  </button>
                 </div>
               )}
 
@@ -1060,7 +1109,7 @@ function App() {
                             type="button"
                             className="btn-secondary btn-archivo-accion btn-archivo-eliminar"
                             onClick={() => void handleEliminarArchivo(a.id, a.storage_key)}
-                            disabled={loading || apiOk !== true}
+                            disabled={apiOk !== true || (loading && !transcripcionActiva)}
                           >
                             Eliminar
                           </button>

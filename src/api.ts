@@ -84,6 +84,7 @@ export async function uploadArchivo(reunionId: number, file: File): Promise<Reun
 export async function transcribirReunion(
   reunionId: number,
   options?: { archivoId?: number; todos?: boolean },
+  signal?: AbortSignal,
 ): Promise<Reunion> {
   const body: { archivoId?: number; todos?: boolean } = {}
   if (options?.archivoId != null) body.archivoId = options.archivoId
@@ -93,9 +94,17 @@ export async function transcribirReunion(
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
+    signal,
   })
   await parseJson<unknown>(res)
   return getReunion(reunionId)
+}
+
+export async function cancelarTranscripcion(reunionId: number): Promise<Reunion> {
+  const res = await fetch(apiUrl(`/api/reuniones/${reunionId}/transcribir/cancelar`), {
+    method: 'POST',
+  })
+  return parseJson<Reunion>(res)
 }
 
 export async function eliminarArchivo(

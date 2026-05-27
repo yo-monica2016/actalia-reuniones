@@ -2,6 +2,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
 import ffmpeg from 'fluent-ffmpeg'
+import ffmpegStaticPath from 'ffmpeg-static'
+import ffprobeStatic from 'ffprobe-static'
 import {
   OPENAI_MAX_AUDIO_BYTES,
   OPENAI_DIARIZE_MAX_BYTES,
@@ -40,11 +42,34 @@ export interface ResultadoTranscripcionPipeline {
   aviso?: string
 }
 
+let ffmpegRutasConfiguradas = false
+
 function ffmpegPathConfig(): void {
-  const bin = process.env.FFMPEG_PATH?.trim()
-  if (bin) ffmpeg.setFfmpegPath(bin)
-  const ffprobe = process.env.FFPROBE_PATH?.trim()
-  if (ffprobe) ffmpeg.setFfprobePath(ffprobe)
+  if (ffmpegRutasConfiguradas) return
+
+  const binEnv = process.env.FFMPEG_PATH?.trim()
+  if (binEnv) {
+    ffmpeg.setFfmpegPath(binEnv)
+    console.log('[audio] ffmpeg desde FFMPEG_PATH (.env)')
+  } else if (ffmpegStaticPath) {
+    ffmpeg.setFfmpegPath(ffmpegStaticPath)
+    console.log('[audio] ffmpeg desde ffmpeg-static (npm)')
+  } else {
+    console.warn('[audio] no hay ffmpeg: define FFMPEG_PATH o npm install ffmpeg-static')
+  }
+
+  const probeEnv = process.env.FFPROBE_PATH?.trim()
+  if (probeEnv) {
+    ffmpeg.setFfprobePath(probeEnv)
+    console.log('[audio] ffprobe desde FFPROBE_PATH (.env)')
+  } else if (ffprobeStatic.path) {
+    ffmpeg.setFfprobePath(ffprobeStatic.path)
+    console.log('[audio] ffprobe desde ffprobe-static (npm)')
+  } else {
+    console.warn('[audio] no hay ffprobe: define FFPROBE_PATH o npm install ffprobe-static')
+  }
+
+  ffmpegRutasConfiguradas = true
 }
 
 function ffprobeAsync(filePath: string): Promise<ffmpeg.FfprobeData> {

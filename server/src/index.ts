@@ -11,10 +11,7 @@ import mysql from 'mysql2/promise'
 import type { ResultSetHeader, RowDataPacket } from 'mysql2'
 import PDFDocument from 'pdfkit'
 import { etiquetaEstado } from './estados'
-import {
-  transcribirStorageKey as transcribirArchivoLocal,
-  whisperTxtPath,
-} from './transcripcion'
+import { whisperTxtPath } from './transcripcion'
 import {
   limpiarTemporales,
   transcribirAudioConPipeline,
@@ -41,6 +38,28 @@ import {
 } from './openai'
 
 const PORT = Number(process.env.PORT) || 3001
+/** Reuniones cuya transcripción debe abortarse (Parar en el front). */
+const transcripcionCanceladas = new Set<number>()
+
+class TranscripcionCanceladaError extends Error {
+  constructor() {
+    super('Transcripción cancelada')
+    this.name = 'TranscripcionCanceladaError'
+  }
+}
+
+async function aplicarCancelacionTranscripcionEnBd(reunionId: number): Promise<void> {
+  await pool.query(
+    `UPDATE reuniones SET estado = ?, error_mensaje = NULL, actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
+    ['audio_listo', reunionId],
+  )
+}
+
+function comprobarCancelacionTranscripcion(reunionId: number): void {
+  if (!transcripcionCanceladas.has(reunionId)) return
+  transcripcionCanceladas.delete(reunionId)
+  throw new TranscripcionCanceladaError()
+}
 
 function parseId(raw: string | string[]): number | null {
   const value = Array.isArray(raw) ? raw[0] : raw
@@ -156,45 +175,38 @@ async function transcribirStorageKey(storageKey: string): Promise<TranscripcionR
     ? `Este audio pesa ${tamanoMb.toFixed(1)} MB. Se procesará con compresión y/o fragmentos antes de transcribir.`
     : undefined
 
-  if (useOpenAiTranscription()) {
-    const temporales: string[] = []
-    try {
-      console.log(`[transcripcion] pipeline OpenAI (comprimir/trocear/diarize): ${storageKey}`)
-      const resultado = await transcribirAudioConPipeline(audioPath, uploadsDir)
-      temporales.push(...resultado.temporales)
-      const txtPath = whisperTxtPath(uploadsDir, storageKey)
-      fs.writeFileSync(txtPath, resultado.texto, 'utf8')
-      console.log(`[transcripcion] pipeline terminó: ${storageKey}`)
-      const aviso = [avisoTamano, resultado.aviso].filter(Boolean).join(' ') || undefined
-      return {
-        texto: resultado.texto,
-        segmentos: resultado.segmentos,
-        diarizada: resultado.diarizada,
-        aviso,
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      console.error(`[transcripcion] pipeline OpenAI falló (${storageKey}):`, msg)
-      if (msg.includes('ffmpeg') || msg.includes('FFmpeg')) {
-        throw new Error(
-          'FFmpeg no está disponible. Instálalo y añádelo al PATH, o define FFMPEG_PATH en server/.env',
-        )
-      }
-    } finally {
-      limpiarTemporales(temporales)
-    }
+  if (!useOpenAiTranscription() || !openAiConfigured()) {
+    throw new Error(
+      'Transcripción no disponible: configura TRANSCRIPTION_PROVIDER=openai y OPENAI_API_KEY en server/.env',
+    )
   }
 
-  const texto = await transcribirArchivoLocal(uploadsDir, storageKey)
-  const txtPath = whisperTxtPath(uploadsDir, storageKey)
-  if (!fs.existsSync(txtPath)) {
-    fs.writeFileSync(txtPath, texto, 'utf8')
-  }
-  return {
-    texto,
-    segmentos: [],
-    diarizada: false,
-    aviso: avisoTamano,
+  const temporales: string[] = []
+  try {
+    console.log(`[transcripcion] pipeline OpenAI (comprimir/trocear/diarize): ${storageKey}`)
+    const resultado = await transcribirAudioConPipeline(audioPath, uploadsDir)
+    temporales.push(...resultado.temporales)
+    const txtPath = whisperTxtPath(uploadsDir, storageKey)
+    fs.writeFileSync(txtPath, resultado.texto, 'utf8')
+    console.log(`[transcripcion] pipeline terminó: ${storageKey}`)
+    const aviso = [avisoTamano, resultado.aviso].filter(Boolean).join(' ') || undefined
+    return {
+      texto: resultado.texto,
+      segmentos: resultado.segmentos,
+      diarizada: resultado.diarizada,
+      aviso,
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error(`[transcripcion] pipeline OpenAI falló (${storageKey}):`, msg)
+    if (msg.includes('ffmpeg') || msg.includes('FFmpeg')) {
+      throw new Error(
+        'FFmpeg no está disponible en el servidor. Ejecuta npm install en server/ o define FFMPEG_PATH en server/.env',
+      )
+    }
+    throw new Error(`Transcripción OpenAI falló: ${msg}`)
+  } finally {
+    limpiarTemporales(temporales)
   }
 }
 async function generarResumenCompletoAsync(
@@ -1026,6 +1038,42 @@ app.post(
   multerSingle('file', 'POST /archivo'),
   handleSubirArchivoReunion,
 )
+app.post('/api/reuniones/:id/transcribir/cancelar', async (req: Request, res: Response) => {
+  const id = parseId(req.params.id)
+  if (id === null) {
+    res.status(400).json({ error: 'id inválido' })
+    return
+  }
+
+  try {
+    transcripcionCanceladas.add(id)
+    await aplicarCancelacionTranscripcionEnBd(id)
+    console.log(`[transcribir] cancelación solicitada reunion=${id}`)
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT * FROM reuniones WHERE id = ? LIMIT 1',
+      [id],
+    )
+    const [archivos] = await pool.query<RowDataPacket[]>(
+      `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
+      [id],
+    )
+    const row = rows[0]
+    if (!row) {
+      res.status(404).json({ error: 'reunión no encontrada' })
+      return
+    }
+
+    res.json({
+      ...row,
+      estado_etiqueta: etiquetaEstado(String(row.estado)),
+      archivos,
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    res.status(500).json({ error: message })
+  }
+})
 app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) => {
   const id = parseId(req.params.id)
   if (id === null) {
@@ -1045,6 +1093,8 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
       res.status(404).json({ error: 'reunión no encontrada' })
       return
     }
+
+    transcripcionCanceladas.delete(id)
 
     const todos = req.body?.todos === true || req.body?.todos === 'true'
     const archivoIdRaw = req.body?.archivoId
@@ -1124,6 +1174,7 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
     }
 
     for (const storageKey of storageKeys) {
+      comprobarCancelacionTranscripcion(id)
       console.log(`[transcribir] 4/6 transcribiendo storageKey=${storageKey}`)
       const resultado = await transcribirStorageKey(storageKey)
       console.log(`[transcribir] 5/6 terminó storageKey=${storageKey} chars=${resultado.texto.length}`)
@@ -1142,6 +1193,8 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
     if (partes.length > 0) {
       transcripcion = partes.join('\n\n').trim()
     }
+
+    comprobarCancelacionTranscripcion(id)
 
     const transcripcionAviso =
       [...new Set(avisos.map((a) => a.trim()).filter(Boolean))].join(' ') || null
@@ -1177,6 +1230,18 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
       archivos,
     })
   } catch (err) {
+    if (err instanceof TranscripcionCanceladaError) {
+      console.log(`[transcribir] cancelada reunion=${id}`)
+      try {
+        await aplicarCancelacionTranscripcionEnBd(id)
+      } catch {
+        /* ignorar */
+      }
+      if (!res.headersSent) {
+        res.status(200).json({ ok: true, cancelada: true })
+      }
+      return
+    }
     const message = err instanceof Error ? err.message : String(err)
     console.error(`[transcribir] ERROR reunion=${id}:`, message)
     try {
@@ -1863,6 +1928,9 @@ void Promise.all([
   .then(() => {
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`API http://127.0.0.1:${PORT} (también http://localhost:${PORT})`)
+      console.log(
+        `[transcripcion] solo OpenAI (sin Whisper local); provider=${process.env.TRANSCRIPTION_PROVIDER ?? 'openai'}`,
+      )
       console.log(`[upload] carpeta uploads: ${uploadsDir}`)
       console.log('[http] logs activos: cada petición muestra --> al entrar y <-- al responder')
       console.log(`[cors] orígenes permitidos (dev): localhost/127.0.0.1 puertos 5173-5179 + ${process.env.CORS_ORIGIN ?? 'por defecto'}`)
