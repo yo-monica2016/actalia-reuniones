@@ -254,7 +254,7 @@ function App({ usuario, onLogout }: AppProps) {
     }
   }, [apiOk, cargarLista])
 
-  
+
 
   useEffect(() => {
     if (!esAdmin) return
@@ -849,8 +849,9 @@ function App({ usuario, onLogout }: AppProps) {
         </div>
         <div className="header-meta">
           <span className="pill pill-ok header-user">
-            {usuario.nombre ?? usuario.email}
-            {usuario.rol === 'admin' && <span className="pill pill-ok admin-rol-pill">admin</span>}
+            {usuario.rol === 'admin'
+              ? 'admin'
+              : (usuario.nombre ?? usuario.email)}
           </span>
           <button type="button" className="btn-secondary btn-logout" onClick={handleLogout}>
             Salir
@@ -1086,7 +1087,7 @@ function App({ usuario, onLogout }: AppProps) {
                   ) : (
                     <p className="muted">No hay usuarios asignados además del dueño.</p>
                   )}
-                                    {(() => {
+                  {(() => {
                     const json = parseTranscripcionJson(detalle.transcripcion_json)
                     if (!json?.diarizada || json.segmentos.length === 0) {
                       return (
