@@ -69,3 +69,56 @@ export interface ReunionListItem {
 export interface ApiError {
   error: string
 }
+
+export type RolUsuario = 'admin' | 'usuario'
+
+export interface Usuario {
+  id: number
+  email: string
+  nombre: string | null
+  rol: RolUsuario
+}
+
+export interface UsuarioListItem extends Usuario {
+  creado_en?: string
+}
+
+export interface LoginResponse {
+  token: string
+  usuario: Usuario
+}
+export interface ReunionUsuarioAcceso {
+  id: number
+  email: string
+  nombre: string | null
+  asignado_en?: string
+}
+
+export interface ReunionUsuariosResponse {
+  dueno: ReunionUsuarioAcceso | null
+  asignados: ReunionUsuarioAcceso[]
+}
+
+export interface Registro {
+  id: number
+  usuario_id: number | null
+  email: string | null
+  accion: string
+  reunion_id: number | null
+  reunion_titulo: string | null
+  entidad_tipo: string | null
+  entidad_id: number | null
+  detalle: Record<string, unknown> | null
+  ip: string | null
+  creado_en: string
+}
+
+export interface RegistrosFiltros {
+  limit?: number
+  offset?: number
+  reunionId?: number
+  usuarioId?: number
+  accion?: string
+  desde?: string
+  hasta?: string
+}

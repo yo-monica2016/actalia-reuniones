@@ -11,21 +11,31 @@ import {
   resumirReunion,
   eliminarArchivo,
   eliminarReunion,
-  archivoUrl,
   downloadArchivo,
+  downloadUrlAutenticada,
   extraerTextoImagen,
   interpretarImagen,
   extraerTextoDocumento,
   setIncluirImagenActa,
   setActaOpciones,
+  fetchArchivoBlob,
   transcripcionPdfUrl,
+  getReunionParticipantes,
   actaPdfUrl,
   resumenPdfUrl,
+  logout,
   API_BASE_DISPLAY,
+  listUsuarios,
+  listReunionesDeUsuario,
+  listReunionesPorHablanteUsuario,
 } from './api'
+import { AdminUsuarios } from './AdminUsuarios'
+import { AdminAccesoReunion } from './AdminAccesoReunion.tsx'
+import { Registros } from './Registros'
 import { RenombrarHablantes } from './components/RenombrarHablantes'
 import { TranscripcionPorHablante } from './components/TranscripcionPorHablante'
-import { speakersUnicos } from './transcripcionView'
+
+import { speakersUnicos, nombreHablante } from './transcripcionView'
 import { leerResumenAlmacenado } from './resumen'
 import { etiquetaEstado } from './estados'
 import type {
@@ -33,6 +43,8 @@ import type {
   Reunion,
   ReunionListItem,
   TranscripcionJsonGuardada,
+  Usuario,
+  UsuarioListItem,
 } from './types'
 import './App.css'
 
@@ -158,9 +170,18 @@ function nombreVisibleArchivo(storageKey: string): string {
   return sinPrefijo || storageKey
 }
 
-function App() {
+type AppProps = {
+  usuario: Usuario
+  onLogout: () => void
+}
+
+function App({ usuario, onLogout }: AppProps) {
+  const esAdmin = usuario.rol === 'admin'
   const [apiOk, setApiOk] = useState<boolean | null>(null)
+  const [archivoBlobUrls, setArchivoBlobUrls] = useState<Record<number, string>>({})
   const [reuniones, setReuniones] = useState<ReunionListItem[]>([])
+  const [filtroUsuarioReunionesId, setFiltroUsuarioReunionesId] = useState('')
+  const [filtroHabloUsuarioId, setFiltroHabloUsuarioId] = useState('')
   const [selectedId, setSelectedId] = useState<number | null>(null)
   const [detalle, setDetalle] = useState<Reunion | null>(null)
   const [tituloNuevo, setTituloNuevo] = useState('')
@@ -186,15 +207,30 @@ function App() {
   const [transcripcionNotaExtra, setTranscripcionNotaExtra] = useState<string | null>(
     null,
   )
+  const [usuariosApp, setUsuariosApp] = useState<UsuarioListItem[]>([])
+  const [participantesReunion, setParticipantesReunion] = useState<{
+    dueno: { id: number; email: string; nombre: string | null } | null
+    asignados: { id: number; email: string; nombre: string | null }[]
+  } | null>(null)
   const transcripcionInicioRef = useRef<number | null>(null)
   const transcripcionAbortRef = useRef<AbortController | null>(null)
   const transcripcionMetaRef = useRef({ duracionSeg: 20 * 60, numAudios: 1 })
   const chunksRef = useRef<Blob[]>([])
   const mediaRefs = useRef<Map<number, HTMLMediaElement>>(new Map())
   const cargarLista = useCallback(async () => {
-    const lista = await listReuniones()
+    const uidHablo = Number(filtroHabloUsuarioId)
+    if (Number.isInteger(uidHablo) && uidHablo > 0) {
+      const lista = await listReunionesPorHablanteUsuario(uidHablo)
+      setReuniones(lista)
+      return
+    }
+    const uid = Number(filtroUsuarioReunionesId)
+    const lista =
+      esAdmin && filtroUsuarioReunionesId && Number.isInteger(uid) && uid > 0
+        ? await listReunionesDeUsuario(uid)
+        : await listReuniones()
     setReuniones(lista)
-  }, [])
+  }, [esAdmin, filtroHabloUsuarioId, filtroUsuarioReunionesId])
 
   const cargarDetalle = useCallback(async (id: number) => {
     const r = await getReunion(id)
@@ -218,6 +254,21 @@ function App() {
     }
   }, [apiOk, cargarLista])
 
+  
+
+  useEffect(() => {
+    if (!esAdmin) return
+    void listUsuarios()
+      .then(setUsuariosApp)
+      .catch(() => setUsuariosApp([]))
+  }, [esAdmin])
+
+  useEffect(() => {
+    if (!esAdmin) return
+    if (apiOk !== true) return
+    void cargarLista()
+  }, [esAdmin, apiOk, cargarLista])
+
   useEffect(() => {
     mediaRefs.current.clear()
     setMostrarResumenes(false)
@@ -225,7 +276,69 @@ function App() {
     setTranscripcionPorcentaje(0)
     setVistaRevisionTranscripcion('nombres')
     setPanelRevisionAbierto(false)
+    setArchivoBlobUrls((prev) => {
+      for (const u of Object.values(prev)) URL.revokeObjectURL(u)
+      return {}
+    })
   }, [selectedId])
+
+  useEffect(() => {
+    if (!detalle?.id) {
+      setParticipantesReunion(null)
+      return
+    }
+    void getReunionParticipantes(detalle.id)
+      .then(setParticipantesReunion)
+      .catch(() => setParticipantesReunion(null))
+  }, [detalle?.id])
+
+  useEffect(() => {
+    if (selectedId == null || !detalle?.archivos?.length) return
+    let cancelado = false
+    const urlsCreadas: string[] = []
+
+    void (async () => {
+      const next: Record<number, string> = {}
+      for (const a of detalle.archivos ?? []) {
+        if (a.tipo !== 'imagen' && a.tipo !== 'audio' && a.tipo !== 'video') continue
+        try {
+          const blob = await fetchArchivoBlob(selectedId, a.id)
+          if (cancelado) return
+          const url = URL.createObjectURL(blob)
+          urlsCreadas.push(url)
+          next[a.id] = url
+        } catch {
+          /* ignorar preview si falla */
+        }
+      }
+      if (!cancelado) setArchivoBlobUrls(next)
+    })()
+
+    return () => {
+      cancelado = true
+      for (const u of urlsCreadas) URL.revokeObjectURL(u)
+    }
+  }, [selectedId, detalle?.archivos, detalle?.actualizado_en])
+
+  function handleLogout() {
+    logout()
+    onLogout()
+  }
+
+  async function handleDescargaPdf(url: string, filename: string) {
+    setLoading(true)
+    setMensaje(null)
+    try {
+      await downloadUrlAutenticada(url, filename)
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al descargar',
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
 
   useEffect(() => {
     if (!transcripcionActiva) return
@@ -735,12 +848,18 @@ function App() {
 
         </div>
         <div className="header-meta">
+          <span className="pill pill-ok header-user">
+            {usuario.nombre ?? usuario.email}
+            {usuario.rol === 'admin' && <span className="pill pill-ok admin-rol-pill">admin</span>}
+          </span>
+          <button type="button" className="btn-secondary btn-logout" onClick={handleLogout}>
+            Salir
+          </button>
           <span
             className={`pill ${apiOk === true ? 'pill-ok' : apiOk === false ? 'pill-error' : 'pill-wait'}`}
           >
             API {apiOk === true ? 'conectada' : apiOk === false ? 'desconectada' : '…'}
           </span>
-
         </div>
       </header>
 
@@ -755,6 +874,17 @@ function App() {
         <div className={`alert alert-${mensaje.tipo === 'ok' ? 'ok' : 'error'}`}>
           {mensaje.text}
         </div>
+      )}
+      {usuario.rol === 'admin' && (
+        <section className="admin-bloque-ancho">
+          <div className="admin-bloque-grid">
+            <div className="panel-inner">
+              <AdminUsuarios />
+              <AdminAccesoReunion />
+            </div>
+            <Registros />
+          </div>
+        </section>
       )}
 
       <div className="layout">
@@ -786,6 +916,54 @@ function App() {
               Actualizar
             </button>
           </div>
+
+          {esAdmin && (
+            <label className="muted reuniones-filtro-label">
+              Filtrar por usuario
+              <select
+                className="admin-usuarios-select-lista"
+                value={filtroUsuarioReunionesId}
+                onChange={(e) => {
+                  setFiltroUsuarioReunionesId(e.target.value)
+                  setFiltroHabloUsuarioId('')
+                }}
+                disabled={loading || apiOk !== true}
+              >
+                <option value="">Administrador (todas)</option>
+                {usuariosApp
+                  .filter((u) => u.rol !== 'admin')
+                  .map((u) => (
+                    <option key={u.id} value={String(u.id)}>
+                      {u.nombre ?? u.email}
+                    </option>
+                  ))}
+              </select>
+            </label>
+          )}
+
+          {esAdmin && (
+            <label className="muted reuniones-filtro-label">
+              Filtrar por hablante (participó)
+              <select
+                className="admin-usuarios-select-lista"
+                value={filtroHabloUsuarioId}
+                onChange={(e) => {
+                  setFiltroHabloUsuarioId(e.target.value)
+                  setFiltroUsuarioReunionesId('')
+                }}
+                disabled={loading || apiOk !== true}
+              >
+                <option value="">—</option>
+                {usuariosApp
+                  .filter((u) => u.rol !== 'admin')
+                  .map((u) => (
+                    <option key={u.id} value={String(u.id)}>
+                      {u.nombre ?? u.email}
+                    </option>
+                  ))}
+              </select>
+            </label>
+          )}
 
           {reuniones.length === 0 ? (
             <p className="muted">No hay reuniones. Crea una arriba.</p>
@@ -819,14 +997,16 @@ function App() {
                 <span className={`badge badge-${detalle.estado}`}>
                   {etiquetaEstado(detalle.estado)}
                 </span>
-                <button
-                  type="button"
-                  className="btn-secondary btn-eliminar-reunion"
-                  onClick={() => void handleEliminarReunion()}
-                  disabled={apiOk !== true || (loading && !transcripcionActiva)}
-                >
-                  Eliminar reunión
-                </button>
+                {esAdmin && (
+                  <button
+                    type="button"
+                    className="btn-secondary btn-eliminar-reunion"
+                    onClick={() => void handleEliminarReunion()}
+                    disabled={apiOk !== true || (loading && !transcripcionActiva)}
+                  >
+                    Eliminar reunión
+                  </button>
+                )}
               </div>
 
               {detalle.estado === 'error' && detalle.error_mensaje && (
@@ -887,6 +1067,47 @@ function App() {
                 </div>
               </dl>
 
+              {participantesReunion && (
+                <section className="upload-section">
+                  <h3>Acceso</h3>
+                  {participantesReunion.dueno && (
+                    <p className="muted">
+                      Dueño:{' '}
+                      {participantesReunion.dueno.nombre ?? participantesReunion.dueno.email}
+                    </p>
+                  )}
+                  {participantesReunion.asignados.length > 0 ? (
+                    <p className="muted">
+                      Asignados:{' '}
+                      {participantesReunion.asignados
+                        .map((u) => u.nombre ?? u.email)
+                        .join(', ')}
+                    </p>
+                  ) : (
+                    <p className="muted">No hay usuarios asignados además del dueño.</p>
+                  )}
+                                    {(() => {
+                    const json = parseTranscripcionJson(detalle.transcripcion_json)
+                    if (!json?.diarizada || json.segmentos.length === 0) {
+                      return (
+                        <p className="muted">
+                          Personas en el audio: (sin transcripción diarizada aún)
+                        </p>
+                      )
+                    }
+                    const voces = speakersUnicos(json.segmentos).map((sp) =>
+                      nombreHablante(sp, json.hablantes),
+                    )
+                    return (
+                      <p className="muted">
+                        Personas en el audio: {voces.join(', ')}
+                      </p>
+                    )
+                  })()}
+                </section>
+              )}
+
+
               <section className="upload-section">
                 <h3>Audio de la reunión</h3>
                 <p className="muted">
@@ -944,7 +1165,7 @@ function App() {
                 ) : (
                   <ul className="archivos">
                     {detalle.archivos.map((a) => {
-                      const url = archivoUrl(detalle.id, a.id)
+                      const mediaUrl = archivoBlobUrls[a.id]
                       return (
                         <li key={a.id}>
                           <strong>{nombreVisibleArchivo(a.storage_key)}</strong>
@@ -952,21 +1173,21 @@ function App() {
                             {a.tipo} · {formatBytes(a.tamano_bytes)} ·{' '}
                             {formatFecha(a.creado_en)}
                           </span>
-                          {a.tipo === 'audio' && (
+                          {a.tipo === 'audio' && mediaUrl && (
                             <audio
                               className="audio-player"
                               controls
-                              src={url}
+                              src={mediaUrl}
                               preload="metadata"
                               ref={(el) => setMediaRef(a.id, el)}
                               onPlay={() => handleMediaPlay(a.id)}
                             />
                           )}
-                          {a.tipo === 'video' && (
+                          {a.tipo === 'video' && mediaUrl && (
                             <video
                               className="audio-player"
                               controls
-                              src={url}
+                              src={mediaUrl}
                               preload="metadata"
                               ref={(el) => setMediaRef(a.id, el)}
                               onPlay={() => handleMediaPlay(a.id)}
@@ -974,11 +1195,15 @@ function App() {
                           )}
                           {a.tipo === 'imagen' && (
                             <>
-                              <img
-                                className="archivo-imagen"
-                                src={url}
-                                alt={a.storage_key}
-                              />
+                              {mediaUrl ? (
+                                <img
+                                  className="archivo-imagen"
+                                  src={mediaUrl}
+                                  alt={a.storage_key}
+                                />
+                              ) : (
+                                <p className="muted">Cargando imagen…</p>
+                              )}
                               <button
                                 type="button"
                                 className="btn-secondary btn-archivo-accion"
@@ -1105,6 +1330,7 @@ function App() {
                               )}
                             </button>
                           )}
+
                           <button
                             type="button"
                             className="btn-secondary btn-archivo-accion btn-archivo-eliminar"
@@ -1113,6 +1339,7 @@ function App() {
                           >
                             Eliminar
                           </button>
+
                         </li>
                       )
                     })}
@@ -1142,13 +1369,19 @@ function App() {
                   </button>
                   {detalle.resumen?.trim() && (
                     <>
-                      <a
+                      <button
+                        type="button"
                         className="btn-secondary descarga-link"
-                        href={resumenPdfUrl(detalle.id)}
-                        download
+                        onClick={() =>
+                          void handleDescargaPdf(
+                            resumenPdfUrl(detalle.id),
+                            `resumen_${detalle.id}.pdf`,
+                          )
+                        }
+                        disabled={loading}
                       >
                         Descargar resumen (PDF)
-                      </a>
+                      </button>
                       <button
                         type="button"
                         className="btn-secondary"
@@ -1258,13 +1491,19 @@ function App() {
                     )}
                   </button>
                   {detalle.transcripcion?.trim() && (
-                    <a
+                    <button
+                      type="button"
                       className="btn-secondary descarga-link"
-                      href={transcripcionPdfUrl(detalle.id)}
-                      download
+                      onClick={() =>
+                        void handleDescargaPdf(
+                          transcripcionPdfUrl(detalle.id),
+                          `transcripcion_${detalle.id}.pdf`,
+                        )
+                      }
+                      disabled={loading}
                     >
                       Descargar PDF
-                    </a>
+                    </button>
                   )}
                   {(() => {
                     const json = parseTranscripcionJson(detalle.transcripcion_json)
@@ -1369,13 +1608,19 @@ function App() {
                       Incluir resumen en el acta (PDF)
                     </label>
                     <div className="descarga-transcripcion-botones">
-                      <a
+                      <button
+                        type="button"
                         className="btn-secondary descarga-link"
-                        href={`${actaPdfUrl(detalle.id)}?v=${encodeURIComponent(detalle.actualizado_en)}`}
-                        download
+                        onClick={() =>
+                          void handleDescargaPdf(
+                            `${actaPdfUrl(detalle.id)}?v=${encodeURIComponent(detalle.actualizado_en)}`,
+                            `acta_${detalle.id}.pdf`,
+                          )
+                        }
+                        disabled={loading}
                       >
                         Descargar acta (PDF)
-                      </a>
+                      </button>
                     </div>
 
 

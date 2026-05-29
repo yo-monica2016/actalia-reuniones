@@ -29,11 +29,114 @@
   font-size: 0.95rem;
 }
 
-.header-meta {
+.header-user {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.9rem;
+}
+
+.btn-logout {
+  padding: 0.35rem 0.75rem;
+  font-size: 0.85rem;
+}
+
+.admin-rol-pill {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  margin-left: 0.35rem;
+}
+
+.admin-bloque-ancho {
+  margin-bottom: 1.25rem;
+}
+
+.admin-bloque-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.25rem;
+  align-items: start;
+}
+
+.admin-bloque-grid > .panel-inner {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.25rem;
+  min-width: 0;
+}
+
+@media (max-width: 900px) {
+  .admin-bloque-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.admin-usuarios {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.admin-usuarios-mensaje {
+  margin: 0 0 0.75rem;
+}
+
+.admin-usuarios-form {
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+.admin-usuarios-ver-lista {
+  display: flex;
+  flex-direction: column;
   gap: 0.35rem;
+  margin-top: 0.25rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+.admin-usuarios-select-lista {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 8px;
+  background: var(--bg, #fff);
+  color: var(--text-h, #1e293b);
+  font: inherit;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+/* Separación entre el panel Usuarios y Acceso a la reunión */
+.admin-acceso {
+  margin-top: 1rem;
+}
+.reuniones-filtro-label {
+  display: block;
+  margin: 0.5rem 0 0.75rem;
+}
+
+.admin-usuarios-lista {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.admin-usuarios-lista li {
+  padding: 0.35rem 0;
+  border-bottom: 1px solid #f1f5f9;
+}
+
+.header-meta {
+  display: flex;
+  flex-direction: row;     /* <- antes column */
+  align-items: center;     /* <- para centrar vertical */
+  justify-content: flex-end;
+  gap: 0.6rem;
+  flex-wrap: wrap;         /* <- opcional: si no cabe, salta de línea */
 }
 
 .api-url {
@@ -147,12 +250,26 @@
 }
 
 .form label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
   font-size: 0.85rem;
   font-weight: 500;
 }
 
 .form input[type='text'] {
   padding: 0.55rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+}
+.form input[type='email'],
+.form input[type='password'],
+.form input[type='text'],
+.form select {
+  padding: 0.32rem 0.5rem;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: var(--bg);
@@ -910,4 +1027,162 @@
   .resumen-tema-titulo {
     color: #93c5fd;
   }
+}
+
+.reunion-acceso-asignar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.75rem;
+}
+
+.reunion-acceso-asignar select {
+  min-width: 14rem;
+  max-width: 100%;
+  padding: 0.5rem 2rem 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text-h);
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1.25;
+  min-height: 2.25rem;
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2364748b' d='M3 4.5 6 7.5 9 4.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.65rem center;
+}
+
+.reunion-acceso-asignar select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.reunion-acceso-asignar .btn-secondary {
+  padding: 0.5rem 0.85rem;
+  border-radius: 8px;
+  font-size: 0.9rem;
+  min-height: 2.25rem;
+}
+
+.reunion-acceso-lista {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.reunion-acceso-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0;
+  border-bottom: 1px solid var(--border, #e5e7eb);
+}
+.reunion-acceso-preview {
+  margin: 0.75rem 0 1rem;
+  padding: 0.75rem;
+  border: 1px dashed var(--border, #e2e8f0);
+  border-radius: 8px;
+}
+
+.reunion-acceso-preview-titulo {
+  margin: 0 0 0.5rem;
+  font-size: 0.85rem;
+}
+
+.reunion-acceso-preview-lista .lista-item {
+  width: 100%;
+  text-align: left;
+}
+
+.admin-registros {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+.registros-filtros {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+
+.registros-filtros label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+.registros-filtros select {
+  width: 100%;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font: inherit;
+  font-size: 0.9rem;
+  background: var(--bg, #fff);
+  color: var(--text-h);
+}
+
+.registros-filtros .btn-secondary {
+  align-self: flex-start;
+}
+
+.registros-cards {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 380px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.registro-card {
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--border, #e2e8f0);
+  border-radius: 8px;
+  background: var(--bg, #fff);
+}
+
+.registro-card-cabecera {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 0.35rem 0.75rem;
+  margin-bottom: 0.25rem;
+}
+
+.registro-card-fecha {
+  font-size: 0.8rem;
+  color: var(--text);
+}
+
+.registro-card-accion {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text-h);
+}
+
+.registro-card-usuario,
+.registro-card-reunion,
+.registro-card-detalle {
+  margin: 0.15rem 0 0;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  word-break: break-word;
+}
+
+.registro-card-reunion {
+  font-weight: 500;
 }

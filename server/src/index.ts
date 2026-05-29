@@ -36,6 +36,24 @@ import {
   useOpenAiTranscription,
   type SegmentoDiarizado,
 } from './openai'
+import { registerAuthRoutes } from './authRoutes'
+import { apiRequiresAuth, requireAuth } from './authMiddleware'
+import {
+  ensureRegistrosTable,
+  ensureReunionesUsuarioId,
+  ensureReunionUsuariosTable,
+  ensureUsuariosTable,
+} from './ensureAuthSchema'
+import { registrar } from './registros'
+import { registerRegistrosRoutes } from './registrosRoutes'
+import { requireAdmin } from './authMiddleware'
+import {
+  archivoPerteneceAReunionVisible,
+  esAdmin,
+  fetchReunionForUser,
+  listReunionesForUser,
+  type AuthUser,
+} from './reunionAccess'
 
 const PORT = Number(process.env.PORT) || 3001
 /** Reuniones cuya transcripción debe abortarse (Parar en el front). */
@@ -66,6 +84,63 @@ function parseId(raw: string | string[]): number | null {
   const id = Number(value)
   if (!Number.isInteger(id) || id <= 0) return null
   return id
+}
+
+function authUser(req: Request): AuthUser {
+  return req.authUser!
+}
+
+function logRegistro(
+  req: Request,
+  data: {
+    accion: string
+    reunionId?: number | null
+    entidadTipo?: string | null
+    entidadId?: number | null
+    detalle?: Record<string, unknown> | null
+    usuarioId?: number | null
+    email?: string | null
+  },
+): void {
+  const u = req.authUser
+  void registrar(pool, {
+    usuarioId: data.usuarioId ?? u?.id ?? null,
+    email: data.email ?? u?.email ?? null,
+    accion: data.accion,
+    reunionId: data.reunionId ?? null,
+    entidadTipo: data.entidadTipo ?? null,
+    entidadId: data.entidadId ?? null,
+    detalle: data.detalle ?? null,
+    req,
+  })
+}
+
+async function reunionVisibleOr404(
+  req: Request,
+  res: Response,
+  reunionId: number,
+): Promise<RowDataPacket | null> {
+  const row = await fetchReunionForUser(pool, reunionId, authUser(req))
+  if (!row) {
+    res.status(404).json({ error: 'no encontrado' })
+    return null
+  }
+  return row
+}
+async function reunionExistsForAdminOr404(
+  res: Response,
+  reunionId: number,
+): Promise<RowDataPacket | null> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    'SELECT id, usuario_id FROM reuniones WHERE id = ? LIMIT 1',
+    [reunionId],
+  )
+  const row = rows[0]
+  if (!row) {
+    res.status(404).json({ error: 'no encontrado' })
+    return null
+  }
+  return row
 }
 function nombreArchivoDescarga(titulo: string, id: number, ext: string): string {
   const base =
@@ -248,7 +323,7 @@ function runOcr(imagePath: string): Promise<string> {
   const lang = process.env.OCR_LANG ?? 'spa'
   let tessdataPrefix: string
   try {
-    ;({ tessdataPrefix } = resolveOcrTessdata(lang))
+    ; ({ tessdataPrefix } = resolveOcrTessdata(lang))
   } catch (err) {
     return Promise.reject(err)
   }
@@ -621,13 +696,61 @@ app.get('/health', async (_req: Request, res: Response) => {
   }
 })
 
-app.get('/api/reuniones', async (_req: Request, res: Response) => {
+registerAuthRoutes(app, pool)
+registerRegistrosRoutes(app, pool)
+
+app.use((req: Request, res: Response, next: NextFunction) => {
+  if (!apiRequiresAuth(req.path)) {
+    next()
+    return
+  }
+  requireAuth(req, res, next)
+})
+
+app.get('/api/reuniones', async (req: Request, res: Response) => {
   try {
-    const [rows] = await pool.query<RowDataPacket[]>(
-      `SELECT id, titulo, estado, creado_en, actualizado_en
-       FROM reuniones
-       ORDER BY creado_en DESC`,
-    )
+    const hablanteUsuarioIdRaw = req.query.hablanteUsuarioId
+    const hablanteUsuarioId = Number(hablanteUsuarioIdRaw)
+    const u = authUser(req)
+
+    if (Number.isInteger(hablanteUsuarioId) && hablanteUsuarioId > 0) {
+      if (u.rol === 'admin') {
+        const [rows] = await pool.query<RowDataPacket[]>(
+          `SELECT DISTINCT r.id, r.titulo, r.estado, r.creado_en, r.actualizado_en, r.usuario_id
+           FROM reuniones r
+           INNER JOIN reunion_hablante_usuario rhu ON rhu.reunion_id = r.id
+           WHERE rhu.usuario_id = ?
+           ORDER BY r.creado_en DESC`,
+          [hablanteUsuarioId],
+        )
+        res.json(
+          rows.map((row) => ({
+            ...row,
+            estado_etiqueta: etiquetaEstado(String(row.estado)),
+          })),
+        )
+        return
+      }
+
+      const [rows] = await pool.query<RowDataPacket[]>(
+        `SELECT DISTINCT r.id, r.titulo, r.estado, r.creado_en, r.actualizado_en, r.usuario_id
+         FROM reuniones r
+         LEFT JOIN reunion_usuarios ru ON ru.reunion_id = r.id AND ru.usuario_id = ?
+         INNER JOIN reunion_hablante_usuario rhu ON rhu.reunion_id = r.id AND rhu.usuario_id = ?
+         WHERE r.usuario_id = ? OR ru.usuario_id = ?
+         ORDER BY r.creado_en DESC`,
+        [u.id, hablanteUsuarioId, u.id, u.id],
+      )
+      res.json(
+        rows.map((row) => ({
+          ...row,
+          estado_etiqueta: etiquetaEstado(String(row.estado)),
+        })),
+      )
+      return
+    }
+
+    const rows = await listReunionesForUser(pool, u)
     res.json(
       rows.map((row) => ({
         ...row,
@@ -648,8 +771,8 @@ app.post('/api/reuniones', async (req: Request, res: Response) => {
   }
   try {
     const [result] = await pool.query<ResultSetHeader>(
-      'INSERT INTO reuniones (titulo, estado) VALUES (?, ?)',
-      [titulo, 'borrador'],
+      'INSERT INTO reuniones (titulo, estado, usuario_id) VALUES (?, ?, ?)',
+      [titulo, 'borrador', authUser(req).id],
     )
     const id = result.insertId
     const [rows] = await pool.query<RowDataPacket[]>(
@@ -661,6 +784,13 @@ app.post('/api/reuniones', async (req: Request, res: Response) => {
       res.status(500).json({ error: 'no se pudo leer la reunión creada' })
       return
     }
+    logRegistro(req, {
+      accion: 'reunion_creada',
+      reunionId: id,
+      entidadTipo: 'reunion',
+      entidadId: id,
+      detalle: { titulo },
+    })
     res.status(201).json(row)
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
@@ -668,22 +798,143 @@ app.post('/api/reuniones', async (req: Request, res: Response) => {
   }
 })
 
+app.get(
+  '/api/reuniones/:id/usuarios',
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    const id = parseId(req.params.id)
+    if (id === null) {
+      res.status(400).json({ error: 'id inválido' })
+      return
+    }
+    try {
+      const reunion = await reunionExistsForAdminOr404(res, id)
+      if (!reunion) return
+
+      const [asignados] = await pool.query<RowDataPacket[]>(
+        `SELECT u.id, u.email, u.nombre, ru.creado_en AS asignado_en
+         FROM reunion_usuarios ru
+         INNER JOIN usuarios u ON u.id = ru.usuario_id
+         WHERE ru.reunion_id = ?
+         ORDER BY u.email`,
+        [id],
+      )
+
+      let dueno: RowDataPacket | null = null
+      const duenoId = reunion.usuario_id != null ? Number(reunion.usuario_id) : null
+      if (duenoId) {
+        const [duenoRows] = await pool.query<RowDataPacket[]>(
+          'SELECT id, email, nombre FROM usuarios WHERE id = ? LIMIT 1',
+          [duenoId],
+        )
+        dueno = duenoRows[0] ?? null
+      }
+
+      res.json({ dueno, asignados })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      res.status(500).json({ error: message })
+    }
+  },
+)
+
+app.post(
+  '/api/reuniones/:id/usuarios',
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    const id = parseId(req.params.id)
+    if (id === null) {
+      res.status(400).json({ error: 'id inválido' })
+      return
+    }
+    const usuarioId = Number(req.body?.usuarioId)
+    if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
+      res.status(400).json({ error: 'usuarioId inválido' })
+      return
+    }
+    try {
+      const reunion = await reunionExistsForAdminOr404(res, id)
+      if (!reunion) return
+
+      const [uRows] = await pool.query<RowDataPacket[]>(
+        'SELECT id, email FROM usuarios WHERE id = ? LIMIT 1',
+        [usuarioId],
+      )
+      if (!uRows[0]) {
+        res.status(404).json({ error: 'usuario no encontrado' })
+        return
+      }
+
+      await pool.query(
+        'INSERT IGNORE INTO reunion_usuarios (reunion_id, usuario_id) VALUES (?, ?)',
+        [id, usuarioId],
+      )
+
+      const [asignados] = await pool.query<RowDataPacket[]>(
+        `SELECT u.id, u.email, u.nombre, ru.creado_en AS asignado_en
+         FROM reunion_usuarios ru
+         INNER JOIN usuarios u ON u.id = ru.usuario_id
+         WHERE ru.reunion_id = ?
+         ORDER BY u.email`,
+        [id],
+      )
+      logRegistro(req, {
+        accion: 'usuario_asignado',
+        reunionId: id,
+        entidadTipo: 'usuario',
+        entidadId: usuarioId,
+        detalle: { usuario_email: String(uRows[0].email) },
+      })
+      res.status(201).json({ ok: true, asignados })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      res.status(500).json({ error: message })
+    }
+  },
+)
+
+app.delete(
+  '/api/reuniones/:id/usuarios/:usuarioId',
+  requireAdmin,
+  async (req: Request, res: Response) => {
+    const id = parseId(req.params.id)
+    const usuarioId = parseId(req.params.usuarioId)
+    if (id === null || usuarioId === null) {
+      res.status(400).json({ error: 'id inválido' })
+      return
+    }
+    try {
+      const reunion = await reunionExistsForAdminOr404(res, id)
+      if (!reunion) return
+
+      await pool.query(
+        'DELETE FROM reunion_usuarios WHERE reunion_id = ? AND usuario_id = ?',
+        [id, usuarioId],
+      )
+      logRegistro(req, {
+        accion: 'usuario_quitado',
+        reunionId: id,
+        entidadTipo: 'usuario',
+        entidadId: usuarioId,
+      })
+      res.status(204).send()
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      res.status(500).json({ error: message })
+    }
+  },
+)
+
 app.get('/api/reuniones/:id', async (req: Request, res: Response) => {
   const id = parseId(req.params.id)
   if (id === null) {
     res.status(400).json({ error: 'id inválido' })
     return
   }
+
   try {
-    const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT * FROM reuniones WHERE id = ? LIMIT 1',
-      [id],
-    )
-    const row = rows[0]
-    if (!row) {
-      res.status(404).json({ error: 'no encontrado' })
-      return
-    }
+    const row = await reunionVisibleOr404(req, res, id)
+    if (!row) return
     const [archivos] = await pool.query<RowDataPacket[]>(
       `${ARCHIVOS_LIST_SELECT}
        WHERE reunion_id = ?
@@ -708,15 +959,8 @@ app.get('/api/reuniones/:id/transcripcion.txt', async (req: Request, res: Respon
   }
 
   try {
-    const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT titulo, transcripcion FROM reuniones WHERE id = ? LIMIT 1',
-      [id],
-    )
-    const row = rows[0]
-    if (!row) {
-      res.status(404).json({ error: 'reunión no encontrada' })
-      return
-    }
+    const row = await reunionVisibleOr404(req, res, id)
+    if (!row) return
 
     const transcripcion = String(row.transcripcion ?? '').trim()
     if (!transcripcion) {
@@ -744,15 +988,8 @@ app.get('/api/reuniones/:id/transcripcion.pdf', async (req: Request, res: Respon
   }
 
   try {
-    const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT titulo, transcripcion, creado_en FROM reuniones WHERE id = ? LIMIT 1',
-      [id],
-    )
-    const row = rows[0]
-    if (!row) {
-      res.status(404).json({ error: 'reunión no encontrada' })
-      return
-    }
+    const row = await reunionVisibleOr404(req, res, id)
+    if (!row) return
 
     const transcripcion = String(row.transcripcion ?? '')
       .replace(/\r\n/g, '\n')
@@ -802,15 +1039,8 @@ app.get('/api/reuniones/:id/resumen.pdf', async (req: Request, res: Response) =>
   }
 
   try {
-    const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT titulo, resumen, creado_en FROM reuniones WHERE id = ? LIMIT 1',
-      [id],
-    )
-    const row = rows[0]
-    if (!row) {
-      res.status(404).json({ error: 'reunión no encontrada' })
-      return
-    }
+    const row = await reunionVisibleOr404(req, res, id)
+    if (!row) return
 
     const cuerpo = formatearResumenParaDescarga(leerResumenAlmacenado(row.resumen))
     if (!cuerpo) {
@@ -857,15 +1087,8 @@ app.get('/api/reuniones/:id/acta.pdf', async (req: Request, res: Response) => {
   }
 
   try {
-    const [reunionRows] = await pool.query<RowDataPacket[]>(
-      'SELECT id, titulo, resumen, transcripcion, transcripcion_json, creado_en, incluir_transcripcion_acta, incluir_resumen_acta FROM reuniones WHERE id = ? LIMIT 1',
-      [id],
-    )
-    const reunion = reunionRows[0]
-    if (!reunion) {
-      res.status(404).json({ error: 'reunión no encontrada' })
-      return
-    }
+    const reunion = await reunionVisibleOr404(req, res, id)
+    if (!reunion) return
 
     const [archivos] = await pool.query<RowDataPacket[]>(
       `SELECT id, tipo, storage_key, duracion_segundos, texto_ocr, incluir_imagen_acta FROM archivos_reunion
@@ -908,6 +1131,16 @@ app.delete('/api/reuniones/:id', async (req: Request, res: Response) => {
   }
 
   try {
+    if (!esAdmin(authUser(req))) {
+      res.status(403).json({ error: 'solo administradores' })
+      return
+    }
+
+    const reunion = await reunionVisibleOr404(req, res, id)
+    if (!reunion) return
+
+    const tituloReunion = String(reunion.titulo ?? '')
+
     const [archivos] = await pool.query<RowDataPacket[]>(
       'SELECT id, storage_key FROM archivos_reunion WHERE reunion_id = ?',
       [id],
@@ -935,6 +1168,13 @@ app.delete('/api/reuniones/:id', async (req: Request, res: Response) => {
       return
     }
 
+    logRegistro(req, {
+      accion: 'reunion_eliminada',
+      reunionId: id,
+      entidadTipo: 'reunion',
+      entidadId: id,
+      detalle: { titulo: tituloReunion },
+    })
     res.status(204).send()
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
@@ -952,15 +1192,9 @@ async function handleSubirArchivoReunion(req: Request, res: Response) {
   console.log(`[upload] 3/5 handler inicio reunion=${id}`)
   try {
     console.log(`[upload] 4/5 consultando reunión en BD reunion=${id}`)
-    const [existing] = await pool.query<RowDataPacket[]>(
-      'SELECT id, estado FROM reuniones WHERE id = ? LIMIT 1',
-      [id],
-    )
-    if (!existing[0]) {
-      console.warn(`[upload] reunión no encontrada id=${id}`)
-      res.status(404).json({ error: 'reunión no encontrada' })
-      return
-    }
+    const existingRow = await reunionVisibleOr404(req, res, id)
+    if (!existingRow) return
+    const existing = [existingRow]
     if (!req.file) {
       res.status(400).json({ error: 'falta archivo (campo multipart: file)' })
       return
@@ -1011,6 +1245,13 @@ async function handleSubirArchivoReunion(req: Request, res: Response) {
     console.log(
       `[upload] 5/5 OK reunion=${id} archivo_id=${insertFile.insertId} estado=${estado}`,
     )
+    logRegistro(req, {
+      accion: 'archivo_subido',
+      reunionId: id,
+      entidadTipo: 'archivo',
+      entidadId: insertFile.insertId,
+      detalle: { storage_key: storageKey, tipo, mime },
+    })
     res.status(201).json({
       reunion_id: id,
       archivo_id: insertFile.insertId,
@@ -1046,23 +1287,23 @@ app.post('/api/reuniones/:id/transcribir/cancelar', async (req: Request, res: Re
   }
 
   try {
+    const row = await reunionVisibleOr404(req, res, id)
+    if (!row) return
+
     transcripcionCanceladas.add(id)
     await aplicarCancelacionTranscripcionEnBd(id)
     console.log(`[transcribir] cancelación solicitada reunion=${id}`)
+    logRegistro(req, {
+      accion: 'transcripcion_cancelada',
+      reunionId: id,
+      entidadTipo: 'reunion',
+      entidadId: id,
+    })
 
-    const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT * FROM reuniones WHERE id = ? LIMIT 1',
-      [id],
-    )
     const [archivos] = await pool.query<RowDataPacket[]>(
       `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
       [id],
     )
-    const row = rows[0]
-    if (!row) {
-      res.status(404).json({ error: 'reunión no encontrada' })
-      return
-    }
 
     res.json({
       ...row,
@@ -1085,14 +1326,8 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
 
   try {
     console.log(`[transcribir] 2/6 comprobando reunión en BD reunion=${id}`)
-    const [reunionRows] = await pool.query<RowDataPacket[]>(
-      'SELECT id FROM reuniones WHERE id = ? LIMIT 1',
-      [id],
-    )
-    if (!reunionRows[0]) {
-      res.status(404).json({ error: 'reunión no encontrada' })
-      return
-    }
+    const reunionCheck = await reunionVisibleOr404(req, res, id)
+    if (!reunionCheck) return
 
     transcripcionCanceladas.delete(id)
 
@@ -1164,6 +1399,17 @@ app.post('/api/reuniones/:id/transcribir', async (req: Request, res: Response) =
       `UPDATE reuniones SET estado = ?, error_mensaje = NULL, actualizado_en = CURRENT_TIMESTAMP(6) WHERE id = ?`,
       ['transcribiendo', id],
     )
+    logRegistro(req, {
+      accion: 'transcripcion_iniciada',
+      reunionId: id,
+      entidadTipo: 'reunion',
+      entidadId: id,
+      detalle: {
+        todos: req.body?.todos === true || req.body?.todos === 'true',
+        archivoId: req.body?.archivoId ?? null,
+        numArchivos: storageKeys.length,
+      },
+    })
 
     let transcripcion = ''
     const partes: string[] = []
@@ -1266,15 +1512,8 @@ app.patch('/api/reuniones/:id/hablantes', async (req: Request, res: Response) =>
   const hablantesEntrada = normalizarMapaHablantes(req.body?.hablantes)
 
   try {
-    const [reunionRows] = await pool.query<RowDataPacket[]>(
-      'SELECT id, transcripcion_json FROM reuniones WHERE id = ? LIMIT 1',
-      [id],
-    )
-    const reunion = reunionRows[0]
-    if (!reunion) {
-      res.status(404).json({ error: 'reunión no encontrada' })
-      return
-    }
+    const reunion = await reunionVisibleOr404(req, res, id)
+    if (!reunion) return
 
     const json = parseTranscripcionJsonAlmacenado(
       String(reunion.transcripcion_json ?? ''),
@@ -1331,7 +1570,181 @@ app.patch('/api/reuniones/:id/hablantes', async (req: Request, res: Response) =>
     res.status(500).json({ error: message })
   }
 })
+async function usuarioTieneAccesoAReunion(reunionId: number, usuarioId: number): Promise<boolean> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT r.id
+     FROM reuniones r
+     LEFT JOIN reunion_usuarios ru ON ru.reunion_id = r.id AND ru.usuario_id = ?
+     WHERE r.id = ? AND (r.usuario_id = ? OR ru.usuario_id = ?)
+     LIMIT 1`,
+    [usuarioId, reunionId, usuarioId, usuarioId],
+  )
+  return Boolean(rows[0])
+}
 
+// Lista de participantes (dueño + asignados) accesible también para usuarios con acceso
+app.get('/api/reuniones/:id/participantes', async (req: Request, res: Response) => {
+  const id = parseId(req.params.id)
+  if (id === null) {
+    res.status(400).json({ error: 'id inválido' })
+    return
+  }
+  try {
+    const reunion = await reunionVisibleOr404(req, res, id)
+    if (!reunion) return
+
+    const duenoId = reunion.usuario_id != null ? Number(reunion.usuario_id) : null
+    let dueno: { id: number; email: string; nombre: string | null } | null = null
+
+    if (duenoId != null && Number.isInteger(duenoId) && duenoId > 0) {
+      const [duenoRows] = await pool.query<RowDataPacket[]>(
+        'SELECT id, email, nombre FROM usuarios WHERE id = ? LIMIT 1',
+        [duenoId],
+      )
+      if (duenoRows[0]) {
+        dueno = {
+          id: Number(duenoRows[0].id),
+          email: String(duenoRows[0].email),
+          nombre: duenoRows[0].nombre != null ? String(duenoRows[0].nombre) : null,
+        }
+      }
+    }
+
+    const [asignados] = await pool.query<RowDataPacket[]>(
+      `SELECT u.id, u.email, u.nombre
+       FROM reunion_usuarios ru
+       INNER JOIN usuarios u ON u.id = ru.usuario_id
+       WHERE ru.reunion_id = ?
+       ORDER BY u.email`,
+      [id],
+    )
+
+    res.json({
+      dueno,
+      asignados: asignados.map((u) => ({
+        id: Number(u.id),
+        email: String(u.email),
+        nombre: u.nombre != null ? String(u.nombre) : null,
+      })),
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    res.status(500).json({ error: message })
+  }
+})
+
+// Lee el mapa { SPEAKER_00: 6, ... }
+app.get('/api/reuniones/:id/hablantes-usuarios', async (req: Request, res: Response) => {
+  const id = parseId(req.params.id)
+  if (id === null) {
+    res.status(400).json({ error: 'id inválido' })
+    return
+  }
+  try {
+    const reunion = await reunionVisibleOr404(req, res, id)
+    if (!reunion) return
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT hablante_key, usuario_id FROM reunion_hablante_usuario WHERE reunion_id = ?',
+      [id],
+    )
+    const map: Record<string, number> = {}
+    for (const r of rows) map[String(r.hablante_key)] = Number(r.usuario_id)
+    res.json(map)
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    res.status(500).json({ error: message })
+  }
+})
+
+// Asigna/actualiza SPEAKER_00 -> usuarioId
+app.put('/api/reuniones/:id/hablantes-usuarios/:hablanteKey', async (req: Request, res: Response) => {
+  const id = parseId(req.params.id)
+  const hablanteKey = String(req.params.hablanteKey ?? '').trim()
+  const usuarioId = Number(req.body?.usuarioId)
+
+  if (id === null || !hablanteKey) {
+    res.status(400).json({ error: 'parámetros inválidos' })
+    return
+  }
+  if (!Number.isInteger(usuarioId) || usuarioId <= 0) {
+    res.status(400).json({ error: 'usuarioId inválido' })
+    return
+  }
+
+  try {
+    const reunion = await reunionVisibleOr404(req, res, id)
+    if (!reunion) return
+
+    const json = parseTranscripcionJsonAlmacenado(String(reunion.transcripcion_json ?? ''))
+    if (!json?.diarizada || json.segmentos.length === 0) {
+      res.status(400).json({ error: 'esta reunión no tiene transcripción diarizada con segmentos' })
+      return
+    }
+    const speakers = new Set(json.segmentos.map((s) => s.speaker.trim() || '?'))
+    if (!speakers.has(hablanteKey)) {
+      res.status(400).json({ error: 'hablanteKey no existe en esta reunión' })
+      return
+    }
+
+    const ok = await usuarioTieneAccesoAReunion(id, usuarioId)
+    if (!ok) {
+      res.status(400).json({ error: 'ese usuario no tiene acceso a la reunión' })
+      return
+    }
+
+    await pool.query(
+      `INSERT INTO reunion_hablante_usuario (reunion_id, hablante_key, usuario_id)
+       VALUES (?, ?, ?)
+       ON DUPLICATE KEY UPDATE usuario_id = VALUES(usuario_id)`,
+      [id, hablanteKey, usuarioId],
+    )
+
+    logRegistro(req, {
+      accion: 'hablante_usuario_asignado',
+      reunionId: id,
+      entidadTipo: 'hablante',
+      entidadId: usuarioId,
+      detalle: { hablante_key: hablanteKey, usuario_id: usuarioId },
+    })
+
+    res.status(200).json({ ok: true })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    res.status(500).json({ error: message })
+  }
+})
+
+// Quita la asignación
+app.delete('/api/reuniones/:id/hablantes-usuarios/:hablanteKey', async (req: Request, res: Response) => {
+  const id = parseId(req.params.id)
+  const hablanteKey = String(req.params.hablanteKey ?? '').trim()
+  if (id === null || !hablanteKey) {
+    res.status(400).json({ error: 'parámetros inválidos' })
+    return
+  }
+  try {
+    const reunion = await reunionVisibleOr404(req, res, id)
+    if (!reunion) return
+
+    await pool.query(
+      'DELETE FROM reunion_hablante_usuario WHERE reunion_id = ? AND hablante_key = ?',
+      [id, hablanteKey],
+    )
+
+    logRegistro(req, {
+      accion: 'hablante_usuario_quitado',
+      reunionId: id,
+      entidadTipo: 'hablante',
+      detalle: { hablante_key: hablanteKey },
+    })
+
+    res.status(204).send()
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    res.status(500).json({ error: message })
+  }
+})
 app.post('/api/reuniones/:id/resumir', async (req: Request, res: Response) => {
   const id = parseId(req.params.id)
   if (id === null) {
@@ -1340,15 +1753,8 @@ app.post('/api/reuniones/:id/resumir', async (req: Request, res: Response) => {
   }
 
   try {
-    const [reunionRows] = await pool.query<RowDataPacket[]>(
-      'SELECT id, titulo, transcripcion FROM reuniones WHERE id = ? LIMIT 1',
-      [id],
-    )
-    const reunion = reunionRows[0]
-    if (!reunion) {
-      res.status(404).json({ error: 'reunión no encontrada' })
-      return
-    }
+    const reunion = await reunionVisibleOr404(req, res, id)
+    if (!reunion) return
 
     const transcripcion = String(reunion.transcripcion ?? '').trim()
     if (!transcripcion) {
@@ -1394,6 +1800,13 @@ app.post('/api/reuniones/:id/resumir', async (req: Request, res: Response) => {
       return
     }
 
+    logRegistro(req, {
+      accion: 'resumen_generado',
+      reunionId: id,
+      entidadTipo: 'reunion',
+      entidadId: id,
+      detalle: { titulo: String(reunion.titulo ?? '') },
+    })
     res.json({
       ...row,
       estado_etiqueta: etiquetaEstado(String(row.estado)),
@@ -1421,6 +1834,12 @@ app.get('/api/reuniones/:reunionId/archivos/:archivoId', async (req: Request, re
     return
   }
   try {
+    if (
+      !(await archivoPerteneceAReunionVisible(pool, reunionId, archivoId, authUser(req)))
+    ) {
+      res.status(404).json({ error: 'archivo no encontrado' })
+      return
+    }
     const [rows] = await pool.query<RowDataPacket[]>(
       `SELECT storage_key, mime, tipo
        FROM archivos_reunion
@@ -1469,6 +1888,12 @@ app.post(
     }
 
     try {
+      if (
+        !(await archivoPerteneceAReunionVisible(pool, reunionId, archivoId, authUser(req)))
+      ) {
+        res.status(404).json({ error: 'archivo no encontrado' })
+        return
+      }
       const [rows] = await pool.query<RowDataPacket[]>(
         `SELECT storage_key, tipo FROM archivos_reunion
          WHERE id = ? AND reunion_id = ?
@@ -1550,6 +1975,12 @@ app.post(
     }
 
     try {
+      if (
+        !(await archivoPerteneceAReunionVisible(pool, reunionId, archivoId, authUser(req)))
+      ) {
+        res.status(404).json({ error: 'archivo no encontrado' })
+        return
+      }
       const [rows] = await pool.query<RowDataPacket[]>(
         `SELECT storage_key, tipo FROM archivos_reunion
          WHERE id = ? AND reunion_id = ?
@@ -1635,14 +2066,8 @@ app.patch('/api/reuniones/:id/acta-opciones', async (req: Request, res: Response
   }
 
   try {
-    const [rows] = await pool.query<RowDataPacket[]>(
-      'SELECT id FROM reuniones WHERE id = ? LIMIT 1',
-      [reunionId],
-    )
-    if (!rows[0]) {
-      res.status(404).json({ error: 'reunión no encontrada' })
-      return
-    }
+    const reunionCheck = await reunionVisibleOr404(req, res, reunionId)
+    if (!reunionCheck) return
 
     const sets: string[] = []
     const vals: number[] = []
@@ -1716,6 +2141,12 @@ app.patch(
     }
 
     try {
+      if (
+        !(await archivoPerteneceAReunionVisible(pool, reunionId, archivoId, authUser(req)))
+      ) {
+        res.status(404).json({ error: 'archivo no encontrado' })
+        return
+      }
       const [rows] = await pool.query<RowDataPacket[]>(
         `SELECT id, tipo, texto_ocr FROM archivos_reunion
          WHERE id = ? AND reunion_id = ?
@@ -1772,6 +2203,12 @@ app.post(
     }
 
     try {
+      if (
+        !(await archivoPerteneceAReunionVisible(pool, reunionId, archivoId, authUser(req)))
+      ) {
+        res.status(404).json({ error: 'archivo no encontrado' })
+        return
+      }
       const [rows] = await pool.query<RowDataPacket[]>(
         `SELECT storage_key, tipo, mime FROM archivos_reunion
          WHERE id = ? AND reunion_id = ?
@@ -1849,6 +2286,13 @@ app.delete(
     }
 
     try {
+
+      if (
+        !(await archivoPerteneceAReunionVisible(pool, reunionId, archivoId, authUser(req)))
+      ) {
+        res.status(404).json({ error: 'archivo no encontrado' })
+        return
+      }
       const [rows] = await pool.query<RowDataPacket[]>(
         `SELECT storage_key FROM archivos_reunion
          WHERE id = ? AND reunion_id = ?
@@ -1896,6 +2340,13 @@ app.delete(
         return
       }
 
+      logRegistro(req, {
+        accion: 'archivo_eliminado',
+        reunionId,
+        entidadTipo: 'archivo',
+        entidadId: archivoId,
+        detalle: { storage_key: storageKey },
+      })
       res.json({
         ...reunion,
         estado_etiqueta: etiquetaEstado(String(reunion.estado)),
@@ -1921,6 +2372,10 @@ app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
 })
 
 void Promise.all([
+  ensureUsuariosTable(pool),
+  ensureReunionesUsuarioId(pool),
+  ensureReunionUsuariosTable(pool),
+  ensureRegistrosTable(pool),
   ensureIncluirImagenActaColumn(),
   ensureActaOpcionesColumn(),
   ensureTranscripcionDiarizacionColumn(),
@@ -1928,6 +2383,7 @@ void Promise.all([
   .then(() => {
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`API http://127.0.0.1:${PORT} (también http://localhost:${PORT})`)
+      console.log('[auth] login en POST /api/auth/login; reuniones requieren JWT')
       console.log(
         `[transcripcion] solo OpenAI (sin Whisper local); provider=${process.env.TRANSCRIPTION_PROVIDER ?? 'openai'}`,
       )
