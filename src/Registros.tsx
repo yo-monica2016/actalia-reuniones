@@ -17,6 +17,7 @@ const ETIQUETAS_ACCION: Record<string, string> = {
   transcripcion_iniciada: 'Transcripción iniciada',
   transcripcion_cancelada: 'Transcripción cancelada',
   resumen_generado: 'Resumen generado',
+  invitacion_enviada: 'Invitación enviada',
 }
 
 function etiquetaAccion(accion: string): string {

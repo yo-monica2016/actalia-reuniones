@@ -41,9 +41,13 @@ import { apiRequiresAuth, requireAuth } from './authMiddleware'
 import {
   ensureRegistrosTable,
   ensureReunionesUsuarioId,
+  ensureReunionInvitacionesTable,
+  ensureReunionTeamsTable,
   ensureReunionUsuariosTable,
+  ensureUsuariosMicrosoftColumns,
   ensureUsuariosTable,
 } from './ensureAuthSchema'
+import { enviarInvitacionReunion, isSmtpConfigured } from './email'
 import { registrar } from './registros'
 import { registerRegistrosRoutes } from './registrosRoutes'
 import { requireAdmin } from './authMiddleware'
@@ -77,6 +81,23 @@ function comprobarCancelacionTranscripcion(reunionId: number): void {
   if (!transcripcionCanceladas.has(reunionId)) return
   transcripcionCanceladas.delete(reunionId)
   throw new TranscripcionCanceladaError()
+}
+
+function parseEmailsInvitacion(raw: unknown): string[] {
+  let list: string[] = []
+  if (Array.isArray(raw)) {
+    list = raw.map((x) => String(x).trim().toLowerCase())
+  } else if (typeof raw === 'string') {
+    list = raw.split(/[,;]+/).map((s) => s.trim().toLowerCase())
+  }
+  const emailRe = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+  return [...new Set(list.filter((e) => emailRe.test(e)))]
+}
+function toMysqlDatetime(iso: string | null): string | null {
+  if (!iso?.trim()) return null
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return null
+  return d.toISOString().slice(0, 19).replace('T', ' ')
 }
 
 function parseId(raw: string | string[]): number | null {
@@ -177,6 +198,10 @@ const projectTessdataDir = path.join(serverRoot, 'tessdata')
 
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true })
+}
+const firmasDir = path.join(uploadsDir, 'firmas')
+if (!fs.existsSync(firmasDir)) {
+  fs.mkdirSync(firmasDir, { recursive: true })
 }
 if (!fs.existsSync(projectTessdataDir)) {
   fs.mkdirSync(projectTessdataDir, { recursive: true })
@@ -551,6 +576,26 @@ async function ensureActaOpcionesColumn(): Promise<void> {
   `)
   console.log('[db] columnas incluir_transcripcion_acta e incluir_resumen_acta creadas')
 }
+
+async function ensureFirmaActaSimuladaColumns(): Promise<void> {
+  try {
+    await pool.query(
+      'SELECT firma_acta_tipo, firma_acta_png, firma_acta_firmada_en, firma_acta_firmante FROM reuniones LIMIT 0',
+    )
+    return
+  } catch (err) {
+    if (!isUnknownColumnError(err, 'firma_acta_tipo')) throw err
+  }
+  await pool.query(`
+    ALTER TABLE reuniones
+      ADD COLUMN firma_acta_tipo VARCHAR(20) NULL,
+      ADD COLUMN firma_acta_png VARCHAR(500) NULL,
+      ADD COLUMN firma_acta_firmada_en DATETIME(6) NULL,
+      ADD COLUMN firma_acta_firmante VARCHAR(200) NULL
+  `)
+  console.log('[db] columnas firma_acta_* creadas')
+}
+
 async function ensureTranscripcionDiarizacionColumn(): Promise<void> {
   try {
     await pool.query(
@@ -658,6 +703,40 @@ const upload = multer({
   storage,
   limits: { fileSize: UPLOAD_MAX_BYTES },
 })
+const FIRMA_MAX_BYTES = 2 * 1024 * 1024
+
+const uploadFirma = multer({
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => {
+      cb(null, firmasDir)
+    },
+    filename: (req, _file, cb) => {
+      const reunionId = parseId(req.params.id) ?? 0
+      cb(null, `firma-${reunionId}-${Date.now()}.png`)
+    },
+  }),
+  limits: { fileSize: FIRMA_MAX_BYTES },
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype === 'image/png' || file.mimetype === 'image/jpeg') {
+      cb(null, true)
+      return
+    }
+    cb(new Error('la firma debe ser PNG o JPEG'))
+  },
+})
+
+function multerFirmaSingle(campo: string) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    uploadFirma.single(campo)(req, res, (err: unknown) => {
+      if (err) {
+        const msg = err instanceof Error ? err.message : String(err)
+        res.status(400).json({ error: msg })
+        return
+      }
+      next()
+    })
+  }
+}
 
 /** Logs por paso: si se congela, la última línea indica dónde. */
 function multerSingle(campo: string, ruta: string) {
@@ -1122,7 +1201,98 @@ app.get('/api/reuniones/:id/acta.pdf', async (req: Request, res: Response) => {
     }
   }
 })
+app.post(
+  '/api/reuniones/:id/acta/firma-simulada',
+  multerFirmaSingle('firma'),
+  async (req: Request, res: Response) => {
+    const reunionId = parseId(req.params.id)
+    if (reunionId === null) {
+      res.status(400).json({ error: 'id inválido' })
+      return
+    }
 
+    if (!req.file) {
+      res.status(400).json({ error: 'falta el archivo de firma (campo "firma")' })
+      return
+    }
+
+    try {
+      const reunionCheck = await reunionVisibleOr404(req, res, reunionId)
+      if (!reunionCheck) return
+
+      const u = authUser(req)
+      const firmanteRaw = String(req.body?.firmante ?? '').trim()
+      const firmante =
+        firmanteRaw ||
+        String(u.nombre ?? '').trim() ||
+        u.email ||
+        'INPRO'
+
+      const relPath = path.join('firmas', req.file.filename).replace(/\\/g, '/')
+
+      const vieja = String(reunionCheck.firma_acta_png ?? '').trim()
+      if (vieja) {
+        const viejaAbs = path.join(uploadsDir, vieja.replace(/\//g, path.sep))
+        if (viejaAbs.startsWith(firmasDir) && fs.existsSync(viejaAbs)) {
+          try {
+            fs.unlinkSync(viejaAbs)
+          } catch {
+            /* ignorar */
+          }
+        }
+      }
+
+      await pool.query(
+        `UPDATE reuniones SET
+          firma_acta_tipo = ?,
+          firma_acta_png = ?,
+          firma_acta_firmada_en = CURRENT_TIMESTAMP(6),
+          firma_acta_firmante = ?,
+          actualizado_en = CURRENT_TIMESTAMP(6)
+        WHERE id = ?`,
+        ['simulada', relPath, firmante.slice(0, 200), reunionId],
+      )
+
+      logRegistro(req, {
+        accion: 'firma_acta_simulada',
+        reunionId,
+        entidadTipo: 'reunion',
+        entidadId: reunionId,
+        detalle: { firmante, path: relPath },
+      })
+
+      const [reunionRows] = await pool.query<RowDataPacket[]>(
+        'SELECT * FROM reuniones WHERE id = ? LIMIT 1',
+        [reunionId],
+      )
+      const [archivos] = await pool.query<RowDataPacket[]>(
+        `${ARCHIVOS_LIST_SELECT} WHERE reunion_id = ? ORDER BY creado_en DESC`,
+        [reunionId],
+      )
+      const reunion = reunionRows[0]
+      if (!reunion) {
+        res.status(404).json({ error: 'reunión no encontrada' })
+        return
+      }
+
+      res.json({
+        ...reunion,
+        estado_etiqueta: etiquetaEstado(String(reunion.estado)),
+        archivos,
+      })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      if (req.file?.path && fs.existsSync(req.file.path)) {
+        try {
+          fs.unlinkSync(req.file.path)
+        } catch {
+          /* ignorar */
+        }
+      }
+      res.status(500).json({ error: message })
+    }
+  },
+)
 app.delete('/api/reuniones/:id', async (req: Request, res: Response) => {
   const id = parseId(req.params.id)
   if (id === null) {
@@ -1626,6 +1796,197 @@ app.get('/api/reuniones/:id/participantes', async (req: Request, res: Response) 
         email: String(u.email),
         nombre: u.nombre != null ? String(u.nombre) : null,
       })),
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    res.status(500).json({ error: message })
+  }
+})
+
+// Listar invitaciones enviadas de una reunión
+app.get('/api/reuniones/:id/invitaciones', async (req: Request, res: Response) => {
+  const id = parseId(req.params.id)
+  if (id === null) {
+    res.status(400).json({ error: 'id inválido' })
+    return
+  }
+  try {
+    const reunion = await reunionVisibleOr404(req, res, id)
+    if (!reunion) return
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT id, reunion_id, email_invitado, mensaje, enviado_por_usuario_id,
+              estado, error_mensaje, creado_en
+       FROM reunion_invitaciones
+       WHERE reunion_id = ?
+       ORDER BY creado_en DESC
+       LIMIT 200`,
+      [id],
+    )
+    res.json(
+      rows.map((r) => ({
+        id: Number(r.id),
+        reunion_id: Number(r.reunion_id),
+        email_invitado: String(r.email_invitado),
+        mensaje: r.mensaje != null ? String(r.mensaje) : null,
+        enviado_por_usuario_id:
+          r.enviado_por_usuario_id != null ? Number(r.enviado_por_usuario_id) : null,
+        estado: String(r.estado),
+        error_mensaje: r.error_mensaje != null ? String(r.error_mensaje) : null,
+        creado_en: String(r.creado_en),
+      })),
+    )
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    res.status(500).json({ error: message })
+  }
+})
+
+app.get('/api/reuniones/:id/convocatoria', async (req: Request, res: Response) => {
+  const id = parseId(req.params.id)
+  if (id === null) {
+    res.status(400).json({ error: 'id inválido' })
+    return
+  }
+  try {
+    const reunion = await reunionVisibleOr404(req, res, id)
+    if (!reunion) return
+    const [rows] = await pool.query<RowDataPacket[]>(
+      'SELECT join_url, titulo, fecha_inicio, fecha_fin FROM reunion_teams WHERE reunion_id = ? LIMIT 1',
+      [id],
+    )
+    const r = rows[0]
+    res.json({
+      join_url: r?.join_url != null ? String(r.join_url) : null,
+      fecha_inicio: r?.fecha_inicio != null ? String(r.fecha_inicio) : null,
+      fecha_fin: r?.fecha_fin != null ? String(r.fecha_fin) : null,
+    })
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    res.status(500).json({ error: message })
+  }
+})
+
+// Enviar invitaciones por correo
+app.post('/api/reuniones/:id/invitaciones', async (req: Request, res: Response) => {
+  const id = parseId(req.params.id)
+  if (id === null) {
+    res.status(400).json({ error: 'id inválido' })
+    return
+  }
+  if (!isSmtpConfigured()) {
+    res.status(503).json({
+      error: 'SMTP no configurado. Añade SMTP_HOST, SMTP_USER y SMTP_PASS en server/.env',
+    })
+    return
+  }
+
+  const emails = parseEmailsInvitacion(req.body?.emails)
+  if (emails.length === 0) {
+    res.status(400).json({ error: 'indica al menos un email válido en "emails"' })
+    return
+  }
+
+  const mensaje =
+    typeof req.body?.mensaje === 'string' ? req.body.mensaje.trim() || null : null
+
+  try {
+    const reunion = await reunionVisibleOr404(req, res, id)
+    if (!reunion) return
+
+    const u = authUser(req)
+    const titulo = String(reunion.titulo ?? 'Reunión')
+
+    const [senderRows] = await pool.query<RowDataPacket[]>(
+      'SELECT nombre, email FROM usuarios WHERE id = ? LIMIT 1',
+      [u.id],
+    )
+    const enviadoPorNombre =
+      senderRows[0]?.nombre != null && String(senderRows[0].nombre).trim()
+        ? String(senderRows[0].nombre).trim()
+        : null
+
+    const teamsJoinUrlRaw =
+      typeof req.body?.teamsJoinUrl === 'string' ? req.body.teamsJoinUrl.trim() : ''
+    const teamsJoinUrl =
+      teamsJoinUrlRaw && /^https?:\/\//i.test(teamsJoinUrlRaw) ? teamsJoinUrlRaw : null
+
+    const fechaInicio =
+      typeof req.body?.fechaInicio === 'string' && req.body.fechaInicio.trim()
+        ? req.body.fechaInicio.trim()
+        : null
+    const fechaFin =
+      typeof req.body?.fechaFin === 'string' && req.body.fechaFin.trim()
+        ? req.body.fechaFin.trim()
+        : null
+
+    if (teamsJoinUrl || fechaInicio || fechaFin) {
+      await pool.query(
+        `INSERT INTO reunion_teams (reunion_id, join_url, titulo, fecha_inicio, fecha_fin, creado_por_usuario_id)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE
+           join_url = COALESCE(VALUES(join_url), join_url),
+           titulo = VALUES(titulo),
+           fecha_inicio = COALESCE(VALUES(fecha_inicio), fecha_inicio),
+           fecha_fin = COALESCE(VALUES(fecha_fin), fecha_fin),
+           creado_por_usuario_id = VALUES(creado_por_usuario_id)`,
+        [id, teamsJoinUrl, titulo, toMysqlDatetime(fechaInicio), toMysqlDatetime(fechaFin), u.id],
+      )
+    }
+
+    const resultados: Array<{
+      email: string
+      ok: boolean
+      error?: string
+    }> = []
+
+    for (const emailInv of emails) {
+      try {
+        await enviarInvitacionReunion({
+          para: emailInv,
+          replyTo: u.email,
+          reunionTitulo: titulo,
+          reunionId: id,
+          mensajeOpcional: mensaje,
+          teamsJoinUrl,
+          fechaInicio,
+          fechaFin,
+          enviadoPorNombre,
+        })
+        await pool.query(
+          `INSERT INTO reunion_invitaciones
+            (reunion_id, email_invitado, mensaje, enviado_por_usuario_id, estado)
+           VALUES (?, ?, ?, ?, 'enviado')`,
+          [id, emailInv, mensaje, u.id],
+        )
+        resultados.push({ email: emailInv, ok: true })
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err)
+        await pool.query(
+          `INSERT INTO reunion_invitaciones
+            (reunion_id, email_invitado, mensaje, enviado_por_usuario_id, estado, error_mensaje)
+           VALUES (?, ?, ?, ?, 'error', ?)`,
+          [id, emailInv, mensaje, u.id, errMsg],
+        )
+        resultados.push({ email: emailInv, ok: false, error: errMsg })
+      }
+    }
+
+    const okCount = resultados.filter((r) => r.ok).length
+    if (okCount > 0) {
+      logRegistro(req, {
+        accion: 'invitacion_enviada',
+        reunionId: id,
+        entidadTipo: 'reunion',
+        entidadId: id,
+        detalle: { emails: resultados.filter((r) => r.ok).map((r) => r.email), titulo },
+      })
+    }
+
+    res.json({
+      enviados: okCount,
+      fallidos: resultados.length - okCount,
+      resultados,
     })
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
@@ -2376,8 +2737,12 @@ void Promise.all([
   ensureReunionesUsuarioId(pool),
   ensureReunionUsuariosTable(pool),
   ensureRegistrosTable(pool),
+  ensureReunionInvitacionesTable(pool),
+  ensureReunionTeamsTable(pool),
+  ensureUsuariosMicrosoftColumns(pool),
   ensureIncluirImagenActaColumn(),
   ensureActaOpcionesColumn(),
+  ensureFirmaActaSimuladaColumns(),
   ensureTranscripcionDiarizacionColumn(),
 ])
   .then(() => {
@@ -2388,6 +2753,7 @@ void Promise.all([
         `[transcripcion] solo OpenAI (sin Whisper local); provider=${process.env.TRANSCRIPTION_PROVIDER ?? 'openai'}`,
       )
       console.log(`[upload] carpeta uploads: ${uploadsDir}`)
+      console.log(`[upload] firmas simuladas: ${firmasDir}`)
       console.log('[http] logs activos: cada petición muestra --> al entrar y <-- al responder')
       console.log(`[cors] orígenes permitidos (dev): localhost/127.0.0.1 puertos 5173-5179 + ${process.env.CORS_ORIGIN ?? 'por defecto'}`)
     })

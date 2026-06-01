@@ -81,3 +81,58 @@ export async function ensureRegistrosTable(pool: Pool): Promise<void> {
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
   `)
 }
+export async function ensureReunionInvitacionesTable(pool: Pool): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reunion_invitaciones (
+      id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+      reunion_id BIGINT UNSIGNED NOT NULL,
+      email_invitado VARCHAR(255) NOT NULL,
+      mensaje TEXT NULL,
+      enviado_por_usuario_id INT UNSIGNED NULL,
+      estado ENUM('enviado', 'error') NOT NULL DEFAULT 'enviado',
+      error_mensaje TEXT NULL,
+      creado_en TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      INDEX idx_inv_reunion (reunion_id),
+      INDEX idx_inv_email (email_invitado),
+      CONSTRAINT fk_inv_reunion
+        FOREIGN KEY (reunion_id) REFERENCES reuniones(id) ON DELETE CASCADE,
+      CONSTRAINT fk_inv_usuario
+        FOREIGN KEY (enviado_por_usuario_id) REFERENCES usuarios(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `)
+}
+
+export async function ensureReunionTeamsTable(pool: Pool): Promise<void> {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS reunion_teams (
+      reunion_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+      teams_meeting_id VARCHAR(255) NULL,
+      join_url VARCHAR(512) NULL,
+      titulo VARCHAR(255) NULL,
+      fecha_inicio DATETIME NULL,
+      fecha_fin DATETIME NULL,
+      creado_por_usuario_id INT UNSIGNED NULL,
+      creado_en TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+      actualizado_en TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+        ON UPDATE CURRENT_TIMESTAMP(6),
+      CONSTRAINT fk_teams_reunion
+        FOREIGN KEY (reunion_id) REFERENCES reuniones(id) ON DELETE CASCADE,
+      CONSTRAINT fk_teams_usuario
+        FOREIGN KEY (creado_por_usuario_id) REFERENCES usuarios(id) ON DELETE SET NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `)
+}
+
+export async function ensureUsuariosMicrosoftColumns(pool: Pool): Promise<void> {
+  try {
+    await pool.query('SELECT microsoft_user_id FROM usuarios LIMIT 0')
+  } catch (err) {
+    if (!isUnknownColumnError(err, 'microsoft_user_id')) throw err
+    await pool.query(`
+      ALTER TABLE usuarios
+        ADD COLUMN microsoft_user_id VARCHAR(128) NULL AFTER rol,
+        ADD COLUMN microsoft_refresh_token TEXT NULL AFTER microsoft_user_id
+    `)
+    console.log('[db] columnas usuarios.microsoft_* creadas')
+  }
+}

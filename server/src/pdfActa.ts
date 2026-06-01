@@ -25,6 +25,19 @@ function rutaLogoActa(): string {
   return ''
 }
 
+function rutaFirmaActaSimulada(
+  reunion: RowDataPacket,
+  uploadsDirPath: string,
+): string | null {
+  if (String(reunion.firma_acta_tipo ?? '').trim() !== 'simulada') return null
+  const rel = String(reunion.firma_acta_png ?? '').trim().replace(/\\/g, '/')
+  if (!rel || rel.includes('..')) return null
+  const abs = path.resolve(uploadsDirPath, rel)
+  const base = path.resolve(uploadsDirPath)
+  if (!abs.startsWith(base) || !fs.existsSync(abs)) return null
+  return abs
+}
+
 async function incrustarLogoPortada(doc: InstanceType<typeof PDFDocument>): Promise<void> {
   const logoPath = rutaLogoActa()
   if (!logoPath) {
@@ -73,8 +86,10 @@ function incluirImagenActaActivo(archivo: RowDataPacket): boolean {
   return v !== 0 && v !== false && v !== '0'
 }
 
-function incluirTranscripcionActaActivo(reunion: RowDataPacket): boolean {
-  return Number(reunion.incluir_transcripcion_acta) === 1
+// Acta sin transcripción (opción desactivada en UI; reactivar devolviendo la línea de abajo).
+function incluirTranscripcionActaActivo(_reunion: RowDataPacket): boolean {
+  return false
+  // return Number(_reunion.incluir_transcripcion_acta) === 1
 }
 
 function incluirResumenActaActivo(reunion: RowDataPacket): boolean {
@@ -216,7 +231,7 @@ async function escribirPortada(
     .fontSize(10)
     .fillColor('#444444')
     .text(
-      'Documento generado a partir de grabación de audio, transcripción automática y resumen elaborado por el sistema.',
+      'Documento generado a partir de la grabación de audio y del resumen elaborado por el sistema.',
       { align: 'center', width: doc.page.width - MARGEN * 2 },
     )
   doc.moveDown(0.75)
@@ -254,7 +269,7 @@ function escribirIntroduccion(
   tituloSeccion(doc, 'Introducción')
   parrafo(
     doc,
-    `En ${fecha || 'la fecha indicada en el sistema'}, con motivo de la reunión titulada «${titulo}», se recopila la presente acta a partir del audio registrado, su transcripción y el resumen generado.`,
+    `En ${fecha || 'la fecha indicada en el sistema'}, con motivo de la reunión titulada «${titulo}», se recopila la presente acta a partir del audio registrado y del resumen generado.`,
   )
 
   if (audios.length > 0) {
@@ -287,12 +302,9 @@ function escribirIntroduccion(
   tituloSeccion(doc, 'Contenido del acta')
   const items = [
     '1. Resumen de la reunión',
-    incluirTranscripcionActaActivo(reunion)
-      ? '2. Transcripción del audio'
-      : null,
-    '3. Materiales adjuntos (imágenes y documentos)',
-    '4. Cierre y firmas',
-  ].filter(Boolean) as string[]
+    '2. Materiales adjuntos (imágenes y documentos)',
+    '3. Cierre y firmas',
+  ]
   for (const item of items) {
     doc.fontSize(10).text(item, { indent: 12 })
   }
@@ -345,7 +357,7 @@ function escribirResumen(
     }
   }
 }
-
+/*
 function escribirTranscripcion(
   doc: InstanceType<typeof PDFDocument>,
   reunion: RowDataPacket,
@@ -381,7 +393,7 @@ function escribirTranscripcion(
 
   tituloSeccion(doc, '2. Transcripción del audio')
   parrafo(doc, textoPlano, 10)
-}
+}*/
 
 async function escribirMateriales(
   doc: InstanceType<typeof PDFDocument>,
@@ -394,7 +406,7 @@ async function escribirMateriales(
   })
   if (materiales.length === 0) return
 
-  tituloSeccion(doc, '3. Materiales adjuntos')
+  tituloSeccion(doc, '2. Materiales adjuntos')
 
   for (const archivo of materiales) {
     const storageKey = String(archivo.storage_key ?? '')
@@ -422,11 +434,15 @@ async function escribirMateriales(
   }
 }
 
-function escribirCierreYFirmas(doc: InstanceType<typeof PDFDocument>): void {
-  tituloSeccion(doc, '4. Cierre del acta')
+function escribirCierreYFirmas(
+  doc: InstanceType<typeof PDFDocument>,
+  reunion: RowDataPacket,
+  uploadsDirPath: string,
+): void {
+  tituloSeccion(doc, '3. Cierre del acta')
   parrafo(
     doc,
-    'Con lo actuado, se da por reproducida en el presente documento la información derivada del audio transcrito y de los materiales adjuntos que figuran en las secciones anteriores. El presente acta se expide como documento electrónico.',
+    'Con lo actuado, se da por reproducida en el presente documento la información derivada del audio registrado y de los materiales adjuntos que figuran en las secciones anteriores. El presente acta se expide como documento electrónico.',
   )
 
   doc.fontSize(11).text('Acuerdos', { underline: true })
@@ -439,15 +455,69 @@ function escribirCierreYFirmas(doc: InstanceType<typeof PDFDocument>): void {
 
   doc.moveDown(1)
   doc.fontSize(11).text('Firmas', { underline: true })
-  doc.moveDown(1.5)
+  doc.moveDown(0.75)
 
   const x0 = doc.page.margins.left ?? MARGEN
   const ancho = doc.page.width - (doc.page.margins.left ?? MARGEN) * 2
-  const y = doc.y
-  doc.moveTo(x0, y + 28).lineTo(x0 + ancho, y + 28).stroke('#000000')
-  doc.fontSize(9).text('Firma / Conforme', x0, y + 32, { width: ancho * 0.55 })
-  doc.text('Fecha', x0 + ancho * 0.58, y + 32, { width: ancho * 0.42 })
-  doc.moveDown(3)
+  const firmaPath = rutaFirmaActaSimulada(reunion, uploadsDirPath)
+
+  if (firmaPath) {
+    const firmante = String(reunion.firma_acta_firmante ?? 'INPRO').trim() || 'INPRO'
+    const cuando = fechaLarga(
+      reunion.firma_acta_firmada_en != null
+        ? String(reunion.firma_acta_firmada_en)
+        : null,
+    )
+
+    const cajaAlto = 95
+    const cajaY = doc.y
+    if (cajaY + cajaAlto > doc.page.height - (doc.page.margins.bottom ?? MARGEN)) {
+      doc.addPage()
+    }
+    const yCaja = doc.y
+
+    doc
+      .roundedRect(x0, yCaja, ancho, cajaAlto, 4)
+      .lineWidth(1)
+      .strokeColor('#1e3a5f')
+      .stroke()
+
+    doc.fontSize(8).fillColor('#444444')
+    doc.text('Firma electrónica (simulación — sin validez legal)', x0 + 8, yCaja + 6, {
+      width: ancho - 16,
+    })
+
+    try {
+      doc.image(firmaPath, x0 + 12, yCaja + 22, {
+        fit: [Math.min(200, ancho - 24), 42],
+      })
+    } catch {
+      doc
+        .fontSize(9)
+        .fillColor('#666666')
+        .text('(No se pudo incrustar la imagen de firma)', x0 + 12, yCaja + 30)
+    }
+
+    doc
+      .fontSize(9)
+      .fillColor('#000000')
+      .text(`Firmado por: ${firmante}`, x0 + 12, yCaja + cajaAlto - 28, { width: ancho * 0.55 })
+    if (cuando) {
+      doc.text(`Fecha: ${cuando}`, x0 + ancho * 0.52, yCaja + cajaAlto - 28, {
+        width: ancho * 0.46,
+      })
+    }
+
+    doc.y = yCaja + cajaAlto + 12
+    doc.fillColor('#000000')
+    doc.moveDown(0.5)
+  } else {
+    const y = doc.y
+    doc.moveTo(x0, y + 28).lineTo(x0 + ancho, y + 28).stroke('#000000')
+    doc.fontSize(9).text('Firma / Conforme', x0, y + 32, { width: ancho * 0.55 })
+    doc.text('Fecha', x0 + ancho * 0.58, y + 32, { width: ancho * 0.42 })
+    doc.moveDown(3)
+  }
 }
 
 export async function escribirPdfActa(
@@ -459,9 +529,9 @@ export async function escribirPdfActa(
   await escribirPortada(doc, reunion)
   escribirIntroduccion(doc, reunion, archivos)
   escribirResumen(doc, reunion)
-  escribirTranscripcion(doc, reunion)
+   // escribirTranscripcion(doc, reunion) // desactivado: acta sin transcripción
   await escribirMateriales(doc, archivos, uploadsDirPath)
-  escribirCierreYFirmas(doc)
+  escribirCierreYFirmas(doc, reunion, uploadsDirPath)
 
   aplicarPiesDePagina(doc)
 }

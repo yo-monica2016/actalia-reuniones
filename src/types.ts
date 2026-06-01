@@ -53,6 +53,10 @@ export interface Reunion {
   resumen?: string | null
   incluir_transcripcion_acta?: boolean | number | string | null
   incluir_resumen_acta?: boolean | number | string | null
+  firma_acta_tipo?: string | null
+  firma_acta_png?: string | null
+  firma_acta_firmada_en?: string | null
+  firma_acta_firmante?: string | null
   error_mensaje?: string | null
   meta?: unknown
   archivos?: ArchivoReunion[]
@@ -121,4 +125,21 @@ export interface RegistrosFiltros {
   accion?: string
   desde?: string
   hasta?: string
+}
+
+export interface ReunionInvitacion {
+  id: number
+  reunion_id: number
+  email_invitado: string
+  mensaje: string | null
+  enviado_por_usuario_id: number | null
+  estado: 'enviado' | 'error' | string
+  error_mensaje: string | null
+  creado_en: string
+}
+
+export interface EnviarInvitacionesResponse {
+  enviados: number
+  fallidos: number
+  resultados: Array<{ email: string; ok: boolean; error?: string }>
 }

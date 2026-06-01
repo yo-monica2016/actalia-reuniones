@@ -6,6 +6,8 @@ import type {
   Registro,
   RegistrosFiltros,
   ReunionUsuariosResponse,
+  ReunionInvitacion,
+  EnviarInvitacionesResponse,
   Usuario,
   UsuarioListItem,
 } from './types'
@@ -391,6 +393,48 @@ export async function getReunionParticipantes(reunionId: number): Promise<Reunio
   return parseJson<ReunionUsuariosResponse>(res)
 }
 
+export async function listInvitacionesReunion(
+  reunionId: number,
+): Promise<ReunionInvitacion[]> {
+  const res = await fetch(apiUrl(`/api/reuniones/${reunionId}/invitaciones`), {
+    headers: authHeaders(),
+  })
+  return parseJson<ReunionInvitacion[]>(res)
+}
+
+export async function getConvocatoriaReunion(reunionId: number): Promise<{
+  join_url: string | null
+  fecha_inicio: string | null
+  fecha_fin: string | null
+}> {
+  const res = await fetch(apiUrl(`/api/reuniones/${reunionId}/convocatoria`), {
+    headers: authHeaders(),
+  })
+  return parseJson(res)
+}
+
+export async function enviarInvitacionesReunion(
+  reunionId: number,
+  body: {
+    emails: string[]
+    mensaje?: string
+    teamsJoinUrl?: string
+    fechaInicio?: string
+    fechaFin?: string
+  },
+): Promise<EnviarInvitacionesResponse> {
+  const res = await fetch(apiUrl(`/api/reuniones/${reunionId}/invitaciones`), {
+    method: 'POST',
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(body),
+  })
+  const data = (await res.json()) as EnviarInvitacionesResponse | ApiError
+  if (!res.ok) {
+    throw new Error((data as ApiError).error ?? `Error ${res.status}`)
+  }
+  return data as EnviarInvitacionesResponse
+}
+
 export async function getHablantesUsuarios(reunionId: number): Promise<Record<string, number>> {
   const res = await fetch(apiUrl(`/api/reuniones/${reunionId}/hablantes-usuarios`), {
     headers: authHeaders(),
@@ -442,6 +486,24 @@ export async function setActaOpciones(
       incluirTranscripcionActa: opciones.incluirTranscripcionActa,
       incluirResumenActa: opciones.incluirResumenActa,
     }),
+  })
+  return parseJson<Reunion>(res)
+}
+export async function guardarFirmaActaSimulada(
+  reunionId: number,
+  firmaPng: Blob,
+  firmante?: string,
+): Promise<Reunion> {
+  const form = new FormData()
+  form.append('firma', firmaPng, 'firma.png')
+  if (firmante?.trim()) {
+    form.append('firmante', firmante.trim())
+  }
+
+  const res = await fetch(apiUrl(`/api/reuniones/${reunionId}/acta/firma-simulada`), {
+    method: 'POST',
+    headers: authHeaders(),
+    body: form,
   })
   return parseJson<Reunion>(res)
 }

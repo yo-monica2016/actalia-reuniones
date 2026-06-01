@@ -14,6 +14,8 @@ server/node_modules
 server/.env
 server/uploads/*
 !server/uploads/.gitkeep
+!server/uploads/firmas/
+!server/uploads/firmas/.gitkeep
 server/tessdata/*.traineddata
 !server/tessdata/.gitkeep
 dist

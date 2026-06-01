@@ -14,6 +14,7 @@ export type AccionRegistro =
   | 'transcripcion_iniciada'
   | 'transcripcion_cancelada'
   | 'resumen_generado'
+  | 'invitacion_enviada'
 
 export interface RegistrarInput {
   usuarioId?: number | null

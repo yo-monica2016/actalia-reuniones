@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-unused-vars */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   checkHealth,
@@ -28,12 +29,15 @@ import {
   listUsuarios,
   listReunionesDeUsuario,
   listReunionesPorHablanteUsuario,
+  guardarFirmaActaSimulada,
 } from './api'
 import { AdminUsuarios } from './AdminUsuarios'
 import { AdminAccesoReunion } from './AdminAccesoReunion.tsx'
 import { Registros } from './Registros'
 import { RenombrarHablantes } from './components/RenombrarHablantes'
 import { TranscripcionPorHablante } from './components/TranscripcionPorHablante'
+import { ConvocatoriaPanel } from './components/ConvocatoriaPanel'
+import { FirmaActaSimuladaModal } from './FirmaActaSimuladaModal'
 
 import { speakersUnicos, nombreHablante } from './transcripcionView'
 import { leerResumenAlmacenado } from './resumen'
@@ -204,6 +208,7 @@ function App({ usuario, onLogout }: AppProps) {
     'nombres' | 'conversacion'
   >('nombres')
   const [panelRevisionAbierto, setPanelRevisionAbierto] = useState(false)
+  const [modalFirmaActaAbierto, setModalFirmaActaAbierto] = useState(false)
   const [transcripcionNotaExtra, setTranscripcionNotaExtra] = useState<string | null>(
     null,
   )
@@ -253,6 +258,16 @@ function App({ usuario, onLogout }: AppProps) {
       )
     }
   }, [apiOk, cargarLista])
+
+  useEffect(() => {
+    if (apiOk !== true) return
+    const params = new URLSearchParams(window.location.search)
+    const rid = Number(params.get('reunion'))
+    if (!Number.isInteger(rid) || rid <= 0) return
+    void cargarDetalle(rid).catch((e: Error) =>
+      setMensaje({ tipo: 'error', text: e.message }),
+    )
+  }, [apiOk, cargarDetalle])
 
 
 
@@ -475,7 +490,7 @@ function App({ usuario, onLogout }: AppProps) {
   function esCancelacionTranscripcion(err: unknown): boolean {
     return err instanceof Error && err.name === 'AbortError'
   }
-
+  // Transcripción manual: funciones activas; botones ocultos en UI (se usa desde Generar resumen).
   async function handleTranscribir(archivoId?: number) {
     if (selectedId == null) return
     transcripcionAbortRef.current?.abort()
@@ -717,6 +732,29 @@ function App({ usuario, onLogout }: AppProps) {
     }
   }
 
+  async function handleConfirmarFirmaActaSimulada(firmaPng: Blob, firmante: string) {
+    if (selectedId == null) return
+    setLoading(true)
+    setMensaje(null)
+    try {
+      const actualizada = await guardarFirmaActaSimulada(selectedId, firmaPng, firmante)
+      setDetalle(actualizada)
+      await cargarLista()
+      setModalFirmaActaAbierto(false)
+      setMensaje({
+        tipo: 'ok',
+        text: 'Acta firmada (simulación). Descarga el PDF para ver la firma.',
+      })
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al guardar la firma',
+      })
+    } finally {
+      setLoading(false)
+    }
+  }
+
   async function handleExtraerTextoDocumento(archivoId: number) {
     if (selectedId == null) return
     setLoading(true)
@@ -735,7 +773,7 @@ function App({ usuario, onLogout }: AppProps) {
       setLoading(false)
     }
   }
-
+  /*
   async function handleResumir() {
     if (selectedId == null) return
     setLoading(true)
@@ -755,7 +793,82 @@ function App({ usuario, onLogout }: AppProps) {
     } finally {
       setLoading(false)
     }
+  }*/
+
+  // Generar resumen: transcribe por detrás si hace falta, luego genera el resumen.
+  async function handleResumir() {
+    if (selectedId == null || !detalle) return
+
+    const archivosAudio =
+      detalle.archivos?.filter((a) => a.tipo === 'audio' || a.tipo === 'video') ?? []
+    if (archivosAudio.length === 0) {
+      setMensaje({
+        tipo: 'error',
+        text: 'Sube o graba audio antes de generar el resumen.',
+      })
+      return
+    }
+
+    setLoading(true)
+    setMensaje(null)
+
+    try {
+      let reunionTrabajo = detalle
+
+      if (!reunionTrabajo.transcripcion?.trim()) {
+        transcripcionAbortRef.current?.abort()
+        const controller = new AbortController()
+        transcripcionAbortRef.current = controller
+        iniciarAvisoTranscripcion(
+          estimarDuracionTranscripcionSeg(reunionTrabajo.archivos, {
+            todos: archivosAudio.length > 1,
+          }),
+        )
+        try {
+          reunionTrabajo = await transcribirReunion(
+            selectedId,
+            archivosAudio.length > 1 ? { todos: true } : {},
+            controller.signal,
+          )
+          setDetalle(reunionTrabajo)
+          await cargarLista()
+        } catch (err) {
+          if (esCancelacionTranscripcion(err)) return
+          throw err
+        } finally {
+          transcripcionAbortRef.current = null
+          finalizarAvisoTranscripcion()
+        }
+
+        if (!reunionTrabajo.transcripcion?.trim()) {
+          setMensaje({
+            tipo: 'error',
+            text: 'No se pudo transcribir el audio. Revisa el archivo e inténtalo de nuevo.',
+          })
+          return
+        }
+      }
+
+      const actualizada = await resumirReunion(selectedId)
+      setDetalle(actualizada)
+      await cargarLista()
+      setMostrarResumenes(true)
+      setMensaje({
+        tipo: 'ok',
+        text: 'Resumen generado. Pulsa «Ver resúmenes» o descarga el PDF.',
+      })
+    } catch (err) {
+      setMensaje({
+        tipo: 'error',
+        text: err instanceof Error ? err.message : 'Error al generar el resumen',
+      })
+      await cargarDetalle(selectedId)
+    } finally {
+      setLoading(false)
+      finalizarAvisoTranscripcion()
+    }
   }
+
   async function handleIniciarGrabacion() {
     if (selectedId == null || grabando || loading) return
     setMensaje(null)
@@ -888,9 +1001,21 @@ function App({ usuario, onLogout }: AppProps) {
         </section>
       )}
 
+      <section className="convocatoria-bloque-ancho panel">
+        <ConvocatoriaPanel
+          replyToEmail={usuario.email}
+          usuariosSugeridos={esAdmin ? usuariosApp : []}
+          disabled={apiOk !== true || loading}
+          onConvocatoriaEnviada={(id) => {
+            void cargarLista().then(() => void cargarDetalle(id))
+          }}
+        />
+      </section>
+
       <div className="layout">
         <aside className="panel">
           <h2>Nueva reunión</h2>
+
           <form onSubmit={handleCrear} className="form">
             <label htmlFor="titulo">Título</label>
             <input
@@ -1019,8 +1144,7 @@ function App({ usuario, onLogout }: AppProps) {
               {transcripcionActiva && (
                 <div className="transcripcion-aviso" role="status">
                   <p className="transcripcion-aviso-titulo">
-                    Estamos transcribiendo tu audio. En archivos largos puede tardar
-                    un rato. No cierres esta página.
+                    Estamos preparando tu audio para el resumen. En archivos largos puede tardar un rato. No cierres esta página.
                   </p>
                   {transcripcionMinutos > 0 && (
                     <p className="transcripcion-aviso-tiempo">
@@ -1036,7 +1160,7 @@ function App({ usuario, onLogout }: AppProps) {
                     aria-valuenow={transcripcionPorcentaje}
                     aria-valuemin={0}
                     aria-valuemax={100}
-                    aria-label="Progreso de la transcripción"
+                    aria-label="Progreso de preparacion del audio"
                   >
                     <div
                       className="transcripcion-progreso-fill"
@@ -1044,14 +1168,14 @@ function App({ usuario, onLogout }: AppProps) {
                     />
                   </div>
                   <p className="transcripcion-progreso-porcentaje">
-                    {transcripcionPorcentaje}% — transcripción en curso
+                    {transcripcionPorcentaje}% — preparando el audio.
                   </p>
                   <button
                     type="button"
                     className="btn-secondary transcripcion-parar-btn"
                     onClick={handlePararTranscripcion}
                   >
-                    Parar transcripción
+                    Cancelar
                   </button>
                 </div>
               )}
@@ -1107,7 +1231,6 @@ function App({ usuario, onLogout }: AppProps) {
                   })()}
                 </section>
               )}
-
 
               <section className="upload-section">
                 <h3>Audio de la reunión</h3>
@@ -1313,6 +1436,7 @@ function App({ usuario, onLogout }: AppProps) {
                           >
                             Descargar
                           </button>
+                          {/* UI transcripción manual — reactivar en el futuro
                           {(a.tipo === 'audio' || a.tipo === 'video') && (
                             <button
                               type="button"
@@ -1331,7 +1455,7 @@ function App({ usuario, onLogout }: AppProps) {
                               )}
                             </button>
                           )}
-
+                          */}
                           <button
                             type="button"
                             className="btn-secondary btn-archivo-accion btn-archivo-eliminar"
@@ -1349,9 +1473,7 @@ function App({ usuario, onLogout }: AppProps) {
               </section>
               <section className="upload-section">
                 <h3>Resumen</h3>
-                <p className="muted">
-                  Genera un texto corto «Ver resúmenes».
-                </p>
+               
                 <div className="descarga-transcripcion-botones">
                   <button
                     type="button"
@@ -1360,13 +1482,16 @@ function App({ usuario, onLogout }: AppProps) {
                     disabled={
                       loading ||
                       apiOk !== true ||
-                      !detalle.transcripcion?.trim() ||
+                      audiosReunion.length === 0 ||
+                      detalle.estado === 'transcribiendo' ||
                       detalle.estado === 'resumiendo'
                     }
                   >
-                    {loading || detalle.estado === 'resumiendo'
-                      ? 'Generando resumen…'
-                      : 'Generar resumen'}
+                    {transcripcionActiva || detalle.estado === 'transcribiendo'
+                      ? 'Preparando audio…'
+                      : loading || detalle.estado === 'resumiendo'
+                        ? 'Generando resumen…'
+                        : 'Generar resumen'}
                   </button>
                   {detalle.resumen?.trim() && (
                     <>
@@ -1434,6 +1559,7 @@ function App({ usuario, onLogout }: AppProps) {
                   </div>
                 )}
               </section>
+                         {/* ——— Sección Transcripción (oculta; flujo: Generar resumen) ———
               <section className="upload-section">
                 <h3>Transcripción</h3>
                 {(() => {
@@ -1573,18 +1699,16 @@ function App({ usuario, onLogout }: AppProps) {
                   )
                 })()}
               </section>
+                         ——— Fin sección Transcripción ——— */}
 
               {(detalle.resumen?.trim() ||
-                detalle.transcripcion?.trim() ||
+               
                 detalle.archivos?.some((a) => a.texto_ocr?.trim()) ||
                 (detalle.archivos?.length ?? 0) > 0) && (
                   <section className="upload-section descarga-transcripcion">
                     <h3>Acta de la reunión</h3>
-                    <p className="muted">
-                      Elige qué incluir en el PDF. Las fotos siguen con su
-                      checkbox en cada imagen.
-                    </p>
-                    <label className="archivo-acta-opcion">
+                   
+                                       {/* <label className="archivo-acta-opcion">
                       <input
                         type="checkbox"
                         checked={incluirTranscripcionActaMarcado(detalle)}
@@ -1596,8 +1720,8 @@ function App({ usuario, onLogout }: AppProps) {
                         }
                       />
                       Incluir transcripción en el acta (PDF)
-                    </label>
-                    <label className="archivo-acta-opcion">
+                    </label> */}
+                                    {/* <label className="archivo-acta-opcion">
                       <input
                         type="checkbox"
                         checked={incluirResumenActaMarcado(detalle)}
@@ -1607,8 +1731,25 @@ function App({ usuario, onLogout }: AppProps) {
                         }
                       />
                       Incluir resumen en el acta (PDF)
-                    </label>
+                    </label> */}
                     <div className="descarga-transcripcion-botones">
+                      <button
+                        type="button"
+                        className="btn-secondary"
+                        onClick={() => setModalFirmaActaAbierto(true)}
+                        disabled={loading || apiOk !== true}
+                      >
+                        {detalle.firma_acta_tipo === 'simulada'
+                          ? 'Volver a firmar (simulación)'
+                          : 'Firmar acta (simulación)'}
+                      </button>
+                      {detalle.firma_acta_tipo === 'simulada' &&
+                        detalle.firma_acta_firmada_en && (
+                          <p className="muted firma-acta-estado">
+                            Firmada (simulación) por {detalle.firma_acta_firmante ?? '—'} el{' '}
+                            {formatFecha(detalle.firma_acta_firmada_en)}
+                          </p>
+                        )}
                       <button
                         type="button"
                         className="btn-secondary descarga-link"
@@ -1628,12 +1769,22 @@ function App({ usuario, onLogout }: AppProps) {
                   </section>
                 )}
               {detalle.estado === 'borrador' && !detalle.archivos?.length && (
-                <p className="hint">Sube un audio para pasar al estado «Audio listo».</p>
+                <p className="hint">Graba o sube un audio y pulsa «Generar resumen».</p>
               )}
             </>
           )}
         </main>
       </div>
+
+      <FirmaActaSimuladaModal
+        abierto={modalFirmaActaAbierto}
+        firmanteInicial={usuario.nombre?.trim() || usuario.email || 'INPRO'}
+        loading={loading}
+        onCerrar={() => setModalFirmaActaAbierto(false)}
+        onConfirmar={(blob, firmante) =>
+          void handleConfirmarFirmaActaSimulada(blob, firmante)
+        }
+      />
     </div>
   )
 }
